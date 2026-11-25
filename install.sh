@@ -399,9 +399,44 @@ refresh_outputs() {
   write_outputs
 }
 
+list_nodes() {
+  local config_file="/usr/local/etc/xray/config.json"
+  local info_file="$INFO_FILE"
+  local shown=0 line
+  echo "节点："
+  echo "  节点 1："
+  if [ -f "$info_file" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        地址：*|端口：*|地区：*|模式：*|SNI：*|套餐：*|限额：*|限制：*|限速：*)
+          echo "    $line"; shown=1 ;;
+      esac
+    done < "$info_file"
+  fi
+  if [ "$shown" = "0" ]; then
+    local port mode sni preset quota
+    port="$(jq -r '.inbounds[0].port // empty' "$config_file" 2>/dev/null || true)"
+    mode="Reality"
+    if jq -e '.inbounds[0].streamSettings.security == "tls"' "$config_file" >/dev/null 2>&1; then mode="TLS"; fi
+    if [ "$mode" = "Reality" ]; then
+      sni="$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$config_file" 2>/dev/null || true)"
+    else
+      sni=""
+    fi
+    preset="$(grep -E '^TQ_PRESET=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"
+    quota="$(grep -E '^TQ_QUOTA=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"
+    [ -n "$port" ] && echo "    端口：$port"
+    echo "    模式：$mode"
+    [ -n "$sni" ] && echo "    SNI：$sni"
+    echo "    套餐：$(tq_preset_label "${preset:-custom}")"
+    if [ "${quota:-0}" = "0" ]; then echo "    限额：不限"; else echo "    限额：$(fmt_bytes "$quota")"; fi
+  fi
+}
+
 delete_node() {
   local config_file="/usr/local/etc/xray/config.json"
   [ -f "$config_file" ] || die "没有节点"
+  list_nodes
   echo "删除节点会停用 xray，删除配置和流量数据，xray 和 BBR 保留。"
   local ans
   ans="$(ask "确认删除？[y/N]: " "N")"
@@ -1123,36 +1158,39 @@ for cmd in curl jq openssl; do
 done
 
 ACTION="${ACTION:-}"
-if [ -f /usr/local/etc/xray/config.json ] && command -v xray >/dev/null 2>&1; then
-  if [ -z "$ACTION" ]; then
-    echo ""
-    echo "  1) 添加节点"
-    echo "  2) 查看节点"
-    echo "  3) 编辑节点"
-    echo "  4) 删除节点"
-    echo "  5) 载入预设"
-    ACTION="$(ask "请选择 [1-5，默认 2]: " "2")"
-    case "$ACTION" in
-      1|add|install) ACTION="add" ;;
-      2|view|show) ACTION="view" ;;
-      3|edit|modify) ACTION="edit" ;;
-      4|delete) ACTION="delete" ;;
-      5|preset) ACTION="preset" ;;
-      *) ACTION="view" ;;
-    esac
-  fi
+if [ -z "$ACTION" ]; then
+  echo ""
+  echo "  1) 添加节点"
+  echo "  2) 查看节点"
+  echo "  3) 编辑节点"
+  echo "  4) 删除节点"
+  echo "  5) 载入预设"
+  ACTION="$(ask "请选择 [1-5，默认 2]: " "2")"
   case "$ACTION" in
-    add|install) info "添加节点" ;;
-    view|show) show_info; exit 0 ;;
-    edit|modify) edit_node; exit 0 ;;
-    delete) delete_node; exit 0 ;;
-    preset) load_preset; exit 0 ;;
-    traffic) traffic_status; exit 0 ;;
-    *) die "ACTION 无效：$ACTION" ;;
+    1|add|install) ACTION="add" ;;
+    2|view|show) ACTION="view" ;;
+    3|edit|modify) ACTION="edit" ;;
+    4|delete) ACTION="delete" ;;
+    5|preset) ACTION="preset" ;;
+    *) ACTION="view" ;;
   esac
 fi
 case "$ACTION" in
-  edit|modify|delete|preset) [ -f /usr/local/etc/xray/config.json ] || die "没有节点" ;;
+  add|install) info "添加节点" ;;
+  view|show|edit|modify|delete|preset)
+    if [ ! -f /usr/local/etc/xray/config.json ]; then
+      echo "没有节点，请先选 1 添加节点"
+      exit 1
+    fi
+    case "$ACTION" in
+      view|show) show_info; exit 0 ;;
+      edit|modify) edit_node; exit 0 ;;
+      delete) delete_node; exit 0 ;;
+      preset) load_preset; exit 0 ;;
+    esac
+    ;;
+  traffic) traffic_status; exit 0 ;;
+  *) die "ACTION 无效：$ACTION" ;;
 esac
 
 MODE="${MODE:-reality}"
