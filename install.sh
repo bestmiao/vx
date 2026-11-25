@@ -37,6 +37,16 @@ parse_bytes() {
   echo $(( s * mult ))
 }
 
+parse_quota() {
+  local s
+  s="$(printf '%s' "$1" | tr -d ' \t\r\n')"
+  [ -z "$s" ] && { echo 0; return 0; }
+  case "$s" in
+    *K|*k|*M|*m|*G|*g|*T|*t) parse_bytes "$s" ;;
+    *) parse_bytes "${s}G" ;;
+  esac
+}
+
 fmt_bytes() {
   local b=$1
   if [ "$b" -lt 1024 ]; then printf '%s B' "$b"; return 0; fi
@@ -294,10 +304,16 @@ modify_node() {
   new_tq_limit="$(norm_tq_limit "$new_tq_limit")" || die "限制模式无效：$new_tq_limit"
   new_tq_quota="$env_tq_quota"
   if [ -z "$new_tq_quota" ]; then
-    new_tq_quota="$(ask "限额 [如 500G，0=不限，回车保持]: " "")"
-    [ -z "$new_tq_quota" ] && new_tq_quota="$cur_tq_quota"
+    new_tq_quota="$(ask "限额 [如 180=180G，0=不限，回车保持]: " "")"
+    if [ -z "$new_tq_quota" ]; then
+      new_tq_quota="$cur_tq_quota"
+      [[ "$new_tq_quota" =~ ^[0-9]+$ ]] || die "限额无效：$new_tq_quota"
+    else
+      new_tq_quota="$(parse_quota "$new_tq_quota")" || die "限额无效：$new_tq_quota"
+    fi
+  else
+    new_tq_quota="$(parse_quota "$new_tq_quota")" || die "限额无效：$new_tq_quota"
   fi
-  new_tq_quota="$(parse_bytes "$new_tq_quota")" || die "限额无效：$new_tq_quota"
   new_tq_rate="$env_tq_rate"
   if [ -z "$new_tq_rate" ]; then
     new_tq_rate="$(ask "限速 [如 125K，回车保持]: " "")"
@@ -950,7 +966,7 @@ if [ -f /usr/local/etc/xray/config.json ] && command -v xray >/dev/null 2>&1; th
   esac
 fi
 
-MODE="${MODE:-}"
+MODE="${MODE:-reality}"
 DOMAIN="${DOMAIN:-}"
 REGION="${REGION:-}"
 REGION_SNI=""
@@ -962,12 +978,6 @@ UUID="${UUID:-}"
 ENABLE_BBR="${ENABLE_BBR:-}"
 PUBLIC_IP="${PUBLIC_IP:-}"
 
-if [ -z "$MODE" ]; then
-  echo "方式："
-  echo "  1) Reality"
-  echo "  2) TLS"
-  MODE="$(ask "选择 [1/2，默认 1]: " "1")"
-fi
 MODE="$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')"
 case "$MODE" in
   1|reality) MODE="reality" ;;
@@ -1016,8 +1026,8 @@ esac
 
 SPLIT="${SPLIT:-}"
 if [ -z "$SPLIT" ]; then
-  SPLIT_ANS="$(ask "分流 [y/N]: " "N")"
-  case "$SPLIT_ANS" in 1|[Yy]*) SPLIT=1 ;; *) SPLIT=0 ;; esac
+  SPLIT_ANS="$(ask "分流 [Y/n]: " "Y")"
+  case "$SPLIT_ANS" in 0|[Nn]*) SPLIT=0 ;; *) SPLIT=1 ;; esac
 else
   case "$SPLIT" in 1|[Yy]*) SPLIT=1 ;; *) SPLIT=0 ;; esac
 fi
@@ -1029,10 +1039,10 @@ TQ_LIMIT="${TQ_LIMIT:-}"
 TQ_QUOTA="${TQ_QUOTA:-}"
 TQ_RATE="${TQ_RATE:-}"
 if [ -z "$TQ_QUOTA" ]; then
-  TQ_QUOTA_ANS="$(ask "限额 [0=不限，如 500G，默认 0]: " "0")"
+  TQ_QUOTA_ANS="$(ask "限额 [0=不限，如 180=180G，默认 0]: " "0")"
   TQ_QUOTA="$TQ_QUOTA_ANS"
 fi
-TQ_QUOTA="$(parse_bytes "$TQ_QUOTA")" || die "限额无效：$TQ_QUOTA"
+TQ_QUOTA="$(parse_quota "$TQ_QUOTA")" || die "限额无效：$TQ_QUOTA"
 if [ "$TQ_QUOTA" -gt 0 ] && [ -z "$TQ_LIMIT" ]; then
   TQ_LIMIT_ANS="$(ask "限制 [1 阻断 / 2 限速，默认 1]: " "1")"
   case "$TQ_LIMIT_ANS" in 2|throttle|限速) TQ_LIMIT=throttle ;; *) TQ_LIMIT=block ;; esac
