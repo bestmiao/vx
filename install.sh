@@ -97,6 +97,48 @@ tq_limit_label() {
   case "$1" in throttle) echo 限速;; *) echo 阻断;; esac
 }
 
+norm_tq_preset() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    gcp|1|谷歌|谷歌云) echo gcp ;;
+    cdt|2|阿里云) echo cdt ;;
+    custom|3|自定义|"") echo custom ;;
+    *) return 1 ;;
+  esac
+}
+
+tq_preset_label() {
+  case "$1" in gcp) echo GCP配置;; cdt) echo 阿里云CDT;; *) echo 自定义;; esac
+}
+
+apply_whitelist() {
+  local cfg="$1" on="$2"
+  if [ "$on" = "1" ]; then
+    jq '.inbounds[0].sniffing = {enabled: true, destOverride: ["http", "tls", "quic"]}
+      | .routing = {rules: [
+          {type: "field", domain: ["geosite:google"], outboundTag: "direct"},
+          {type: "field", outboundTag: "blocked"}
+        ]}
+      | if ([.outbounds[]?.tag] | index("direct")) == null then .outbounds += [{protocol: "freedom", tag: "direct"}] else . end
+      | if ([.outbounds[]?.tag] | index("blocked")) == null then .outbounds += [{protocol: "blackhole", tag: "blocked"}] else . end' \
+      "$cfg" > "$cfg.tmp" || die "白名单路由写入失败"
+  else
+    jq 'del(.routing)' "$cfg" > "$cfg.tmp" || die "白名单清理失败"
+  fi
+  jq -e . "$cfg.tmp" >/dev/null || die "配置不是合法 JSON"
+  mv "$cfg.tmp" "$cfg"
+}
+
+ensure_geosite() {
+  local dat="/usr/local/share/xray/geosite.dat"
+  [ -s "$dat" ] && return 0
+  info "补装 geosite.dat..."
+  curl -fsSL -o "$TMPDIR_WORK/install-release.sh" \
+    https://github.com/XTLS/Xray-install/raw/main/install-release.sh
+  test -s "$TMPDIR_WORK/install-release.sh" || die "下载失败"
+  bash "$TMPDIR_WORK/install-release.sh" update-geodata || die "geosite.dat 补装失败"
+  [ -s "$dat" ] || die "缺少 geosite.dat，白名单无法使用"
+}
+
 ask() {
   local prompt="$1" default="$2" ans=""
   read -rp "$prompt" ans || true
@@ -310,21 +352,60 @@ modify_node() {
 
   local env_tq_mode="${TQ_MODE:-}" env_tq_period="${TQ_PERIOD:-}" env_tq_start="${TQ_START:-}"
   local env_tq_limit="${TQ_LIMIT:-}" env_tq_quota="${TQ_QUOTA:-}" env_tq_rate="${TQ_RATE:-}"
-  local env_tq_iface="${TQ_IFACE:-}"
-  local cur_tq_mode cur_tq_period cur_tq_start cur_tq_limit cur_tq_quota cur_tq_rate
+  local env_tq_iface="${TQ_IFACE:-}" env_tq_preset="${TQ_PRESET:-}"
+  local cur_tq_mode cur_tq_period cur_tq_start cur_tq_limit cur_tq_quota cur_tq_rate cur_tq_preset
   cur_tq_mode=total; cur_tq_period=monthly; cur_tq_start=1; cur_tq_limit=block; cur_tq_quota=0; cur_tq_rate=128000
+  cur_tq_preset=custom
   if [ -f "$TQ_CONF" ]; then
-    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""; TQ_IFACE=""
+    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""; TQ_IFACE=""; TQ_PRESET=""
     . "$TQ_CONF"
     cur_tq_mode="${TQ_MODE:-total}"; cur_tq_period="${TQ_PERIOD:-monthly}"; cur_tq_start="${TQ_START:-1}"
     cur_tq_limit="${TQ_LIMIT:-block}"; cur_tq_quota="${TQ_QUOTA:-0}"; cur_tq_rate="${TQ_RATE:-128000}"
+    cur_tq_preset="${TQ_PRESET:-custom}"
+    case "$cur_tq_preset" in gcp|cdt|custom) ;; *) cur_tq_preset=custom ;; esac
   fi
   TQ_IFACE="${env_tq_iface:-${TQ_IFACE:-}}"
+  echo "套餐：$(tq_preset_label "$cur_tq_preset")"
+  [ "$cur_tq_preset" = "gcp" ] && echo "白名单：仅谷歌系"
   echo "统计：$(tq_mode_label "$cur_tq_mode") / 周期：$(tq_period_label "$cur_tq_period") / 起始日：$cur_tq_start / 范围：整机"
   if [ "$cur_tq_quota" = "0" ]; then
     echo "限制：$(tq_limit_label "$cur_tq_limit") / 限额：不限 / 限速：$(fmt_bytes "$cur_tq_rate")/s"
   else
     echo "限制：$(tq_limit_label "$cur_tq_limit") / 限额：$(fmt_bytes "$cur_tq_quota") / 限速：$(fmt_bytes "$cur_tq_rate")/s"
+  fi
+
+  local new_tq_preset preset_ans
+  new_tq_preset="$env_tq_preset"
+  if [ -z "$new_tq_preset" ]; then
+    echo "  1) GCP配置  2) 阿里云CDT  3) 自定义"
+    preset_ans="$(ask "套餐 [1/2/3，当前 $(tq_preset_label "$cur_tq_preset")，回车保持]: " "")"
+    if [ -z "$preset_ans" ]; then new_tq_preset="$cur_tq_preset"; else new_tq_preset="$(norm_tq_preset "$preset_ans")" || die "套餐无效：$preset_ans"; fi
+  else
+    new_tq_preset="$(norm_tq_preset "$new_tq_preset")" || die "套餐无效：$new_tq_preset"
+  fi
+  if [ "$new_tq_preset" = "gcp" ]; then
+    env_tq_mode=total; env_tq_period=monthly; env_tq_start=1; env_tq_limit=block; env_tq_quota=180G
+  elif [ "$new_tq_preset" = "cdt" ]; then
+    env_tq_mode=max; env_tq_period=monthly; env_tq_start=1; env_tq_limit=block; env_tq_quota=180G
+  fi
+  if [ "$new_tq_preset" != "custom" ]; then
+    env_tq_rate="${env_tq_rate:-$cur_tq_rate}"
+  fi
+  if [ "$cur_mode" = "reality" ]; then
+    if [ "$new_tq_preset" = "gcp" ]; then
+      REGION_LABEL="美国"
+      if [ "$(sni_region "$new_sni")" != "us" ]; then
+        REGION=us; new_sni="$(region_to_sni us)"
+      fi
+    elif [ "$new_tq_preset" = "cdt" ]; then
+      REGION_LABEL="香港"
+      if [ "$(sni_region "$new_sni")" != "hk" ]; then
+        REGION=hk; new_sni="$(region_to_sni hk)"
+      fi
+    fi
+  fi
+  if [ "$new_tq_preset" = "gcp" ]; then
+    ensure_geosite
   fi
 
   local new_tq_mode new_tq_period new_tq_start new_tq_limit new_tq_quota new_tq_rate
@@ -377,6 +458,7 @@ modify_node() {
   new_tq_sig="$new_tq_mode|$new_tq_period|$new_tq_start"
   TQ_MODE="$new_tq_mode"; TQ_PERIOD="$new_tq_period"; TQ_START="$new_tq_start"
   TQ_LIMIT="$new_tq_limit"; TQ_QUOTA="$new_tq_quota"; TQ_RATE="$new_tq_rate"; TQ_PORT="$new_port"
+  TQ_PRESET="$new_tq_preset"
   write_tq_conf
   if [ "$old_tq_sig" != "$new_tq_sig" ]; then
     if [ -f "$TQ_STATE" ]; then
@@ -412,6 +494,11 @@ modify_node() {
   fi
   jq -e . "$config_file.tmp" >/dev/null || die "修改后的配置不是合法 JSON"
   mv "$config_file.tmp" "$config_file"
+  if [ "$new_tq_preset" = "gcp" ]; then
+    apply_whitelist "$config_file" 1
+  else
+    apply_whitelist "$config_file" 0
+  fi
   xray run -test -config "$config_file" || die "配置校验失败"
   systemctl restart xray
   sleep 2
@@ -440,6 +527,7 @@ modify_node() {
   OUT_SPLIT="$new_split"
   OUT_TQ_MODE="$new_tq_mode"; OUT_TQ_PERIOD="$new_tq_period"; OUT_TQ_START="$new_tq_start"
   OUT_TQ_LIMIT="$new_tq_limit"; OUT_TQ_QUOTA="$new_tq_quota"; OUT_TQ_RATE="$new_tq_rate"
+  OUT_TQ_PRESET="$new_tq_preset"
   OUT_B_ADDR="$b_addr"
   OUT_ADDR="$b_addr"
   write_outputs
@@ -469,6 +557,7 @@ write_tq_conf() {
     echo "TQ_RATE=$TQ_RATE"
     echo "TQ_PORT=$TQ_PORT"
     echo "TQ_IFACE=${TQ_IFACE:-}"
+    echo "TQ_PRESET=${TQ_PRESET:-custom}"
   } > "$TQ_CONF.tmp"
   mv "$TQ_CONF.tmp" "$TQ_CONF"
   chmod 600 "$TQ_CONF"
@@ -527,6 +616,8 @@ write_outputs() {
       echo "手机扫链接只能导入上传腿，分流配置需手动导入。"
     fi
     echo "统计：$(tq_mode_label "${OUT_TQ_MODE:-total}")"
+    echo "套餐：$(tq_preset_label "${OUT_TQ_PRESET:-custom}")"
+    [ "${OUT_TQ_PRESET:-custom}" = "gcp" ] && echo "白名单：仅谷歌系"
     echo "范围：整机"
     echo "周期：$(tq_period_label "${OUT_TQ_PERIOD:-monthly}")"
     echo "起始日：${OUT_TQ_START:-1}"
@@ -744,7 +835,7 @@ period_bounds() {
 }
 load_conf() {
   local env_iface="${TQ_IFACE:-}"
-  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=0; TQ_RATE=128000; TQ_PORT=443; TQ_IFACE=""
+  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=0; TQ_RATE=128000; TQ_PORT=443; TQ_IFACE=""; TQ_PRESET=custom
   if [ -f "$TQ_CONF" ]; then
     . "$TQ_CONF"
   fi
@@ -752,6 +843,7 @@ load_conf() {
   case "$TQ_MODE" in out|in|total|max) ;; *) TQ_MODE=total ;; esac
   case "$TQ_PERIOD" in monthly|quarterly|yearly) ;; *) TQ_PERIOD=monthly ;; esac
   case "$TQ_LIMIT" in block|throttle) ;; *) TQ_LIMIT=block ;; esac
+  case "$TQ_PRESET" in gcp|cdt|custom) ;; *) TQ_PRESET=custom ;; esac
   [[ "$TQ_START" =~ ^[0-9]+$ ]] && [ "$TQ_START" -ge 1 ] && [ "$TQ_START" -le 28 ] || TQ_START=1
   [[ "$TQ_QUOTA" =~ ^[0-9]+$ ]] || TQ_QUOTA=0
   [[ "$TQ_RATE" =~ ^[0-9]+$ ]] || TQ_RATE=128000
@@ -927,6 +1019,11 @@ show_status() {
     dstart=$P_START; dend=$P_END
   fi
   echo "统计：$(mode_label "$TQ_MODE")"
+  case "$TQ_PRESET" in
+    gcp) echo "套餐：GCP配置"; echo "白名单：仅谷歌系" ;;
+    cdt) echo "套餐：阿里云CDT" ;;
+    *) echo "套餐：自定义" ;;
+  esac
   echo "范围：整机"
   echo "周期：$(period_label "$TQ_PERIOD")（$(period_desc "$TQ_PERIOD" "$TQ_START")）"
   echo "本周期：$(date -d "@$dstart" +%Y-%m-%d) 至 $(date -d "@$dend" +%Y-%m-%d)"
@@ -994,7 +1091,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 if [ "$#" -gt 0 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
   echo "用法：sudo ./install.sh"
-  echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP TQ_MODE TQ_PERIOD TQ_START TQ_LIMIT TQ_QUOTA TQ_RATE TQ_IFACE"
+  echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP TQ_MODE TQ_PERIOD TQ_START TQ_LIMIT TQ_QUOTA TQ_RATE TQ_IFACE TQ_PRESET"
   exit 0
 fi
 if [ "$#" -gt 0 ] && [ "$1" = "--show-traffic" ]; then traffic_status; exit 0; fi
@@ -1109,6 +1206,36 @@ TQ_LIMIT="${TQ_LIMIT:-}"
 TQ_QUOTA="${TQ_QUOTA:-}"
 TQ_RATE="${TQ_RATE:-}"
 TQ_IFACE="${TQ_IFACE:-}"
+TQ_PRESET="${TQ_PRESET:-}"
+cur_tq_preset=custom
+if [ -f "$TQ_CONF" ]; then
+  cur_tq_preset="$(grep '^TQ_PRESET=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || echo custom)"
+  case "$cur_tq_preset" in gcp|cdt|custom) ;; *) cur_tq_preset=custom ;; esac
+fi
+if [ -z "$TQ_PRESET" ]; then
+  echo "  1) GCP配置  2) 阿里云CDT  3) 自定义"
+  preset_ans="$(ask "套餐 [1/2/3，当前 $(tq_preset_label "$cur_tq_preset")，回车保持]: " "")"
+  if [ -z "$preset_ans" ]; then TQ_PRESET="$cur_tq_preset"; else TQ_PRESET="$(norm_tq_preset "$preset_ans")" || die "套餐无效：$preset_ans"; fi
+else
+  TQ_PRESET="$(norm_tq_preset "$TQ_PRESET")" || die "套餐无效：$TQ_PRESET"
+fi
+if [ "$TQ_PRESET" = "gcp" ]; then
+  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA="180G"
+  if [ "$MODE" = "reality" ]; then
+    REGION_LABEL="美国"
+    if [ "$(sni_region "$REALITY_TARGET")" != "us" ]; then
+      REGION=us; REGION_SNI="$(region_to_sni us)"; REALITY_TARGET="$REGION_SNI"
+    fi
+  fi
+elif [ "$TQ_PRESET" = "cdt" ]; then
+  TQ_MODE=max; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA="180G"
+  if [ "$MODE" = "reality" ]; then
+    REGION_LABEL="香港"
+    if [ "$(sni_region "$REALITY_TARGET")" != "hk" ]; then
+      REGION=hk; REGION_SNI="$(region_to_sni hk)"; REALITY_TARGET="$REGION_SNI"
+    fi
+  fi
+fi
 if [ -z "$TQ_QUOTA" ]; then
   TQ_QUOTA_ANS="$(ask "限额 [0=不限，如 180=180G，默认 0]: " "0")"
   TQ_QUOTA="$TQ_QUOTA_ANS"
@@ -1161,6 +1288,10 @@ if ! command -v xray >/dev/null 2>&1; then
   command -v xray >/dev/null 2>&1 || die "安装失败，未找到 xray"
 else
   info "已安装：$(xray version 2>/dev/null | head -n 1 || echo 未知版本)"
+fi
+
+if [ "$TQ_PRESET" = "gcp" ]; then
+  ensure_geosite
 fi
 
 CERT_FILE=""
@@ -1262,6 +1393,9 @@ jq -n \
   }' > "$CONFIG_FILE.tmp"
 jq -e . "$CONFIG_FILE.tmp" >/dev/null || die "配置不是合法 JSON"
 mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+if [ "$TQ_PRESET" = "gcp" ]; then
+  apply_whitelist "$CONFIG_FILE" 1
+fi
 
 if id xray >/dev/null 2>&1; then
   chgrp xray "$CONFIG_FILE" 2>/dev/null || true
@@ -1320,6 +1454,7 @@ fi
 OUT_ADDR="$OUT_B_ADDR"
 OUT_TQ_MODE="$TQ_MODE"; OUT_TQ_PERIOD="$TQ_PERIOD"; OUT_TQ_START="$TQ_START"
 OUT_TQ_LIMIT="$TQ_LIMIT"; OUT_TQ_QUOTA="$TQ_QUOTA"; OUT_TQ_RATE="$TQ_RATE"
+OUT_TQ_PRESET="$TQ_PRESET"
 TQ_PORT="$PORT"
 write_tq_conf
 install_traffic_watch
