@@ -107,7 +107,7 @@ norm_tq_preset() {
 }
 
 tq_preset_label() {
-  case "$1" in gcp) echo GCP配置;; cdt) echo 阿里云CDT;; *) echo 自定义;; esac
+  case "$1" in gcp) echo GCP;; cdt) echo 阿里云CDT;; *) echo 自定义;; esac
 }
 
 apply_whitelist() {
@@ -469,7 +469,7 @@ load_preset() {
     new_tq_preset="$(norm_tq_preset "$new_tq_preset")" || die "套餐无效：$new_tq_preset"
   else
     echo "当前套餐：$(tq_preset_label "$cur_tq_preset")"
-    echo "  1) GCP配置：180G / 总计 / 月 / 1日 / 阻断 / 限速 $rate_label / 美国 / 白名单仅谷歌系"
+    echo "  1) GCP：180G / 总计 / 月 / 1日 / 阻断 / 美国 / 白名单仅谷歌系"
     echo "  2) 阿里云CDT：180G / 最大值 / 月 / 1日 / 阻断 / 限速 $rate_label / 香港 / 无白名单"
     preset_ans="$(ask "请选择 [1/2，0 返回]: " "0")"
     case "$preset_ans" in
@@ -484,7 +484,7 @@ load_preset() {
   local new_tq_mode new_tq_period new_tq_start new_tq_limit new_tq_quota new_tq_rate
   new_tq_rate="$cur_tq_rate"
   if [ "$new_tq_preset" = "gcp" ]; then
-    new_tq_mode=total; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320
+    new_tq_mode=total; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320; new_tq_rate=0
   elif [ "$new_tq_preset" = "cdt" ]; then
     new_tq_mode=max; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320
   else
@@ -630,11 +630,6 @@ write_outputs() {
       echo "分离配置 B：$SPLIT_B_FILE"
     fi
     [ -n "${OUT_BBR:-}" ] && echo "BBR：$OUT_BBR"
-    if [ "$OUT_SPLIT" = "1" ]; then
-      echo "注意："
-      echo "单机分离：上传、下载同一地址，防关联弱于双机；速度为本地速度，无跨地区延迟。"
-      echo "手机扫链接只能导入上传腿，分流配置需手动导入。"
-    fi
     echo "统计：$(tq_mode_label "${OUT_TQ_MODE:-total}")"
     echo "套餐：$(tq_preset_label "${OUT_TQ_PRESET:-custom}")"
     [ "${OUT_TQ_PRESET:-custom}" = "gcp" ] && echo "白名单：仅谷歌系"
@@ -643,7 +638,7 @@ write_outputs() {
     echo "起始日：${OUT_TQ_START:-1}"
     echo "限制：$(tq_limit_label "${OUT_TQ_LIMIT:-block}")"
     if [ "${OUT_TQ_QUOTA:-0}" = "0" ]; then echo "限额：不限"; else echo "限额：$(fmt_bytes "${OUT_TQ_QUOTA}")"; fi
-    echo "限速：$(fmt_bytes "${OUT_TQ_RATE:-128000}")/s"
+    if [ "${OUT_TQ_RATE:-128000}" = "0" ]; then echo "限速：不限速"; else echo "限速：$(fmt_bytes "${OUT_TQ_RATE:-128000}")/s"; fi
     echo "流量文件：$TQ_STATE"
     echo "链接："
     echo "$OUT_LINK"
@@ -1040,7 +1035,7 @@ show_status() {
   fi
   echo "统计：$(mode_label "$TQ_MODE")"
   case "$TQ_PRESET" in
-    gcp) echo "套餐：GCP配置"; echo "白名单：仅谷歌系" ;;
+    gcp) echo "套餐：GCP"; echo "白名单：仅谷歌系" ;;
     cdt) echo "套餐：阿里云CDT" ;;
     *) echo "套餐：自定义" ;;
   esac
