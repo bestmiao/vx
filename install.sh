@@ -460,9 +460,6 @@ load_preset() {
   fi
   TQ_IFACE="${env_tq_iface:-${TQ_IFACE:-}}"
 
-  local rate_label
-  rate_label="$(fmt_bytes "$cur_tq_rate")/s"
-
   local new_tq_preset preset_ans
   new_tq_preset="${env_tq_preset:-}"
   if [ -n "$new_tq_preset" ]; then
@@ -470,7 +467,7 @@ load_preset() {
   else
     echo "当前套餐：$(tq_preset_label "$cur_tq_preset")"
     echo "  1) GCP：180G / 总计 / 月 / 1日 / 阻断 / 美国 / 白名单仅谷歌系"
-    echo "  2) 阿里云CDT：180G / 最大值 / 月 / 1日 / 阻断 / 限速 $rate_label / 香港 / 无白名单"
+    echo "  2) 阿里云CDT：180G / 最大值 / 月 / 1日 / 阻断 / 香港 / 无白名单"
     preset_ans="$(ask "请选择 [1/2，0 返回]: " "0")"
     case "$preset_ans" in
       0|"") return 0 ;;
@@ -486,7 +483,7 @@ load_preset() {
   if [ "$new_tq_preset" = "gcp" ]; then
     new_tq_mode=total; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320; new_tq_rate=0
   elif [ "$new_tq_preset" = "cdt" ]; then
-    new_tq_mode=max; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320
+    new_tq_mode=max; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320; new_tq_rate=0
   else
     new_tq_mode="$cur_tq_mode"; new_tq_period="$cur_tq_period"; new_tq_start="$cur_tq_start"
     new_tq_limit="$cur_tq_limit"; new_tq_quota="$cur_tq_quota"
