@@ -103,14 +103,31 @@ ask() {
   printf '%s' "${ans:-$default}"
 }
 
-region_to_sni() {
+sni_pool() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
-    hk|hongkong|香港) echo "www.apple.com" ;;
-    jp|japan|日本) echo "www.amazon.co.jp" ;;
-    sg|singapore|新加坡) echo "www.amazon.sg" ;;
-    us|usa|america|美国) echo "www.microsoft.com" ;;
-    *) echo "www.microsoft.com" ;;
+    hk|hongkong|香港) echo "www.apple.com www.microsoft.com www.google.com www.cloudflare.com" ;;
+    jp|japan|日本) echo "www.amazon.co.jp www.yahoo.co.jp www.rakuten.co.jp www.google.co.jp" ;;
+    sg|singapore|新加坡) echo "www.amazon.sg www.google.com.sg www.shopee.sg www.lazada.sg" ;;
+    us|usa|america|美国) echo "www.microsoft.com www.apple.com www.amazon.com www.google.com" ;;
+    *) echo "www.microsoft.com www.apple.com www.amazon.com www.google.com" ;;
   esac
+}
+region_to_sni() {
+  local pool arr pick
+  pool="$(sni_pool "$1")"
+  arr=($pool)
+  [ "${#arr[@]}" -eq 0 ] && { printf '%s' "www.microsoft.com"; return 0; }
+  pick="${arr[$((RANDOM % ${#arr[@]}))]}"
+  printf '%s' "$pick"
+}
+sni_region() {
+  local s="$1" found="" r
+  for r in hk jp sg us; do
+    case " $(sni_pool "$r") " in
+      *" $s "*) [ -n "$found" ] && { printf ''; return 0; }; found="$r" ;;
+    esac
+  done
+  printf '%s' "$found"
 }
 region_label() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
@@ -126,6 +143,13 @@ region_label() {
 ask_region() {
   local choice=""
   REGION="${REGION:-}"
+  case "$REGION" in
+    1) REGION="hk" ;;
+    2) REGION="jp" ;;
+    3) REGION="sg" ;;
+    4) REGION="us" ;;
+    5) REGION="custom" ;;
+  esac
   if [ -z "$REGION" ]; then
     echo "地区："
     echo "  1) 香港"
@@ -225,6 +249,20 @@ modify_node() {
   fi
   is_path "$new_path" || die "路径无效：$new_path"
 
+  local cur_region=""
+  cur_region="$(grep -i '^地区' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' | tr -d ' \r\n' || true)"
+  case "$cur_region" in
+    香港) cur_region="hk" ;;
+    日本) cur_region="jp" ;;
+    新加坡) cur_region="sg" ;;
+    美国) cur_region="us" ;;
+    自定义) cur_region="custom" ;;
+    *) cur_region="" ;;
+  esac
+  if [ -z "$cur_region" ] && [ -n "$cur_sni" ]; then
+    cur_region="$(sni_region "$cur_sni")"
+  fi
+
   new_sni="${REALITY_TARGET:-}"
   if [ "$cur_mode" = "reality" ]; then
     if [ -n "$new_sni" ]; then
@@ -232,15 +270,25 @@ modify_node() {
       REGION_LABEL="自定义"
     elif [ -n "${REGION:-}" ]; then
       ask_region
-      new_sni="$REGION_SNI"
+      if [ "$REGION" = "$cur_region" ] && [ -n "$cur_region" ] && [ "$cur_region" != "custom" ]; then
+        new_sni="$cur_sni"
+      else
+        new_sni="$REGION_SNI"
+      fi
     else
       echo "  1) 香港  2) 日本  3) 新加坡  4) 美国  5) 自定义"
       local sel
       sel="$(ask "SNI [回车保持 $cur_sni]: " "")"
       if [ -n "$sel" ]; then
-        REGION="$sel"; ask_region; new_sni="$REGION_SNI"
+        REGION="$sel"; ask_region
+        if [ "$REGION" = "$cur_region" ] && [ -n "$cur_region" ] && [ "$cur_region" != "custom" ]; then
+          new_sni="$cur_sni"
+        else
+          new_sni="$REGION_SNI"
+        fi
       else
-        new_sni="$cur_sni"; REGION_LABEL=""
+        new_sni="$cur_sni"
+        [ -n "$cur_region" ] && REGION_LABEL="$(region_label "$cur_region")"
       fi
     fi
   else
@@ -280,13 +328,13 @@ modify_node() {
   local new_tq_mode new_tq_period new_tq_start new_tq_limit new_tq_quota new_tq_rate
   new_tq_mode="$env_tq_mode"
   if [ -z "$new_tq_mode" ]; then
-    new_tq_mode="$(ask "统计 [out/in/total/max，回车保持]: " "")"
+    new_tq_mode="$(ask "统计 [出站/入站/总计/最大值，回车保持]: " "")"
     [ -z "$new_tq_mode" ] && new_tq_mode="$cur_tq_mode"
   fi
   new_tq_mode="$(norm_tq_mode "$new_tq_mode")" || die "统计模式无效：$new_tq_mode"
   new_tq_period="$env_tq_period"
   if [ -z "$new_tq_period" ]; then
-    new_tq_period="$(ask "周期 [monthly/quarterly/yearly，回车保持]: " "")"
+    new_tq_period="$(ask "周期 [月/季/年，回车保持]: " "")"
     [ -z "$new_tq_period" ] && new_tq_period="$cur_tq_period"
   fi
   new_tq_period="$(norm_tq_period "$new_tq_period")" || die "统计周期无效：$new_tq_period"
@@ -298,7 +346,7 @@ modify_node() {
   [[ "$new_tq_start" =~ ^[0-9]+$ ]] && [ "$new_tq_start" -ge 1 ] && [ "$new_tq_start" -le 28 ] || die "起始日无效：$new_tq_start，应为 1-28"
   new_tq_limit="$env_tq_limit"
   if [ -z "$new_tq_limit" ]; then
-    new_tq_limit="$(ask "限制 [block/throttle，回车保持]: " "")"
+    new_tq_limit="$(ask "限制 [阻断/限速，回车保持]: " "")"
     [ -z "$new_tq_limit" ] && new_tq_limit="$cur_tq_limit"
   fi
   new_tq_limit="$(norm_tq_limit "$new_tq_limit")" || die "限制模式无效：$new_tq_limit"
@@ -897,7 +945,7 @@ WATCHEOF
   chmod 700 "$TQ_WATCH"
   cat > /etc/systemd/system/traffic-watch.service <<'SVCEOF'
 [Unit]
-Description=traffic
+Description=流量看守
 After=network.target
 [Service]
 Type=oneshot
@@ -907,7 +955,7 @@ WantedBy=multi-user.target
 SVCEOF
   cat > /etc/systemd/system/traffic-watch.timer <<'TMREOF'
 [Unit]
-Description=traffic
+Description=流量看守定时器
 [Timer]
 OnBootSec=60
 OnUnitActiveSec=60
