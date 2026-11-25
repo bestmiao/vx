@@ -164,6 +164,7 @@ modify_node() {
   command -v jq >/dev/null 2>&1 || die "需要 jq"
 
   local cur_port cur_uuid cur_path cur_mode cur_sni cur_priv cur_pub cur_sid cur_cert cur_key
+  cur_priv=""; cur_pub=""; cur_sid=""
   local cur_split new_split split_ans
   cur_port="$(jq -r '.inbounds[0].port' "$config_file")"
   cur_uuid="$(jq -r '.inbounds[0].settings.clients[0].id' "$config_file")"
@@ -184,10 +185,10 @@ modify_node() {
   cur_split=0
   if grep -q '^分流：开' "$info_file" 2>/dev/null; then cur_split=1; fi
 
-  local cur_mode_num=1
-  [ "$cur_mode" = "tls" ] && cur_mode_num=2
+  local cur_mode_label="Reality"
+  [ "$cur_mode" = "tls" ] && cur_mode_label="TLS"
   echo ""
-  echo "模式：$cur_mode_num"
+  echo "模式：$cur_mode_label"
   echo "端口：$cur_port"
   echo "UUID：$cur_uuid"
   echo "路径：$cur_path"
@@ -422,8 +423,8 @@ TQ_STATE="/usr/local/etc/xray/traffic.json"
 TQ_WATCH="/usr/local/bin/traffic-watch"
 
 write_outputs() {
-  local mode_num encoded_path base_link
-  if [ "$OUT_MODE" = "reality" ]; then mode_num=1; else mode_num=2; fi
+  local mode_label encoded_path base_link
+  if [ "$OUT_MODE" = "reality" ]; then mode_label="Reality"; else mode_label="TLS"; fi
   encoded_path="$(printf '%s' "$OUT_PATH" | sed 's|/|%2F|g')"
   base_link="vless://$OUT_UUID@$OUT_ADDR:$OUT_PORT?encryption=none&security=$OUT_MODE&sni=$OUT_SNI&fp=chrome"
   if [ "$OUT_MODE" = "reality" ]; then
@@ -439,7 +440,7 @@ write_outputs() {
     echo "端口：$OUT_PORT"
     echo "UUID：$OUT_UUID"
     echo "路径：$OUT_PATH"
-    echo "模式：$mode_num"
+    echo "模式：$mode_label"
     echo "SNI：$OUT_SNI"
     if [ "$OUT_MODE" = "reality" ]; then
       echo "公钥：$OUT_PUB"
@@ -963,8 +964,8 @@ PUBLIC_IP="${PUBLIC_IP:-}"
 
 if [ -z "$MODE" ]; then
   echo "方式："
-  echo "  1"
-  echo "  2"
+  echo "  1) Reality"
+  echo "  2) TLS"
   MODE="$(ask "选择 [1/2，默认 1]: " "1")"
 fi
 MODE="$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')"
@@ -1044,9 +1045,9 @@ TQ_LIMIT="$(norm_tq_limit "${TQ_LIMIT:-block}")" || die "限制模式无效：$T
 TQ_RATE="$(parse_bytes "${TQ_RATE:-125K}")" || die "限速值无效：$TQ_RATE"
 if [ "$TQ_LIMIT" = "throttle" ] && [ "$TQ_RATE" -le 0 ]; then die "限速模式下限速值必须大于 0"; fi
 
-if [ "$MODE" = "reality" ]; then MODE_NUM=1; else MODE_NUM=2; fi
+if [ "$MODE" = "reality" ]; then MODE_LABEL="Reality"; else MODE_LABEL="TLS"; fi
 echo ""
-echo "模式：$MODE_NUM"
+echo "模式：$MODE_LABEL"
 if [ "$MODE" = "tls" ]; then echo "域名：$DOMAIN"; else echo "地区：${REGION_LABEL:-}"; echo "SNI：$REALITY_TARGET"; fi
 echo "端口：$PORT"
 echo "路径：$XHTTP_PATH"
