@@ -1211,51 +1211,37 @@ for cmd in curl jq openssl; do
   command -v "$cmd" >/dev/null 2>&1 || warn "$cmd 未安装，稍后安装"
 done
 
-ACTION="${ACTION:-}"
-if [ -z "$ACTION" ]; then
-  echo ""
-  echo "  1) 添加节点"
-  echo "  2) 查看节点"
-  echo "  3) 编辑节点"
-  echo "  4) 删除节点"
-  echo "  5) 载入预设"
-  ACTION="$(ask "请选择 [1-5，默认 2]: " "2")"
-  case "$ACTION" in
-    1|add|install) ACTION="add" ;;
-    2|view|show) ACTION="view" ;;
-    3|edit|modify) ACTION="edit" ;;
-    4|delete) ACTION="delete" ;;
-    5|preset) ACTION="preset" ;;
-    *) ACTION="view" ;;
-  esac
+VX_URL="${VX_URL:-https://raw.githubusercontent.com/bestmiao/vx/main/install.sh}"
+VX_BIN="${VX_BIN:-/usr/local/bin/vx}"
+VX_BACKUP="${VX_BACKUP:-/usr/local/bin/vx-install.sh}"
+install_vx_shortcut() {
+  if ! cat > "$VX_BIN" <<EOF
+#!/usr/bin/env bash
+VX_URL="$VX_URL"
+VX_BACKUP="$VX_BACKUP"
+tmp="\$(mktemp)"
+if curl -fsSL "\$VX_URL" -o "\$tmp" 2>/dev/null; then
+  cp "\$tmp" "\$VX_BACKUP" 2>/dev/null || true
+  bash "\$tmp" "\$@"
+  rc=\$?
+  rm -f "\$tmp"
+  exit \$rc
+elif [ -f "\$VX_BACKUP" ]; then
+  echo "拉取最新脚本失败，使用本地备份"
+  bash "\$VX_BACKUP" "\$@"
+else
+  echo "拉取最新脚本失败，且没有本地备份" >&2
+  exit 1
 fi
-case "$ACTION" in
-  add|install) info "添加节点" ;;
-  view|show|edit|modify|delete)
-    if [ ! -f /usr/local/etc/xray/config.json ]; then
-      echo "没有节点，请先选 1 添加节点"
-      exit 1
-    fi
-    case "$ACTION" in
-      view|show) show_info; exit 0 ;;
-      edit|modify) edit_node; exit 0 ;;
-      delete) delete_node; exit 0 ;;
-    esac
-    ;;
-  preset)
-    if [ -f /usr/local/etc/xray/config.json ]; then
-      load_preset; exit 0
-    fi
-    if load_preset; then
-      info "添加节点"
-    else
-      exit 0
-    fi
-    ;;
-  traffic) traffic_status; exit 0 ;;
-  *) die "ACTION 无效：$ACTION" ;;
-esac
+EOF
+  then
+    warn "写入 $VX_BIN 失败"
+  fi
+  chmod +x "$VX_BIN" 2>/dev/null || true
+  curl -fsSL "$VX_URL" -o "$VX_BACKUP" 2>/dev/null || warn "保存 vx 备份失败（GitHub 连不上），vx 离线时无法用备份打开菜单"
+}
 
+do_add() {
 MODE="${MODE:-reality}"
 DOMAIN="${DOMAIN:-}"
 REGION="${REGION:-}"
@@ -1537,3 +1523,68 @@ echo "配置：$CONFIG_FILE"
 echo "日志：journalctl -u xray -f"
 echo "保存到：$INFO_FILE"
 if [ "$MODE" = "reality" ]; then echo "私钥只在服务端，不要发给别人。"; fi
+}
+
+install_vx_shortcut
+
+ACTION="${ACTION:-}"
+INTERACTIVE=0
+[ -z "$ACTION" ] && INTERACTIVE=1
+while :; do
+  if [ "$INTERACTIVE" = 1 ]; then
+    echo ""
+    echo "  1) 添加节点"
+    echo "  2) 查看节点"
+    echo "  3) 编辑节点"
+    echo "  4) 删除节点"
+    echo "  5) 载入预设"
+    echo "  6) 退出脚本"
+    menu_ans=""
+    if ! read -rp "请选择 [1-6，默认 2]: " menu_ans; then
+      echo ""
+      exit 0
+    fi
+    ACTION="${menu_ans:-2}"
+    case "$ACTION" in
+      1|add|install) ACTION="add" ;;
+      2|view|show) ACTION="view" ;;
+      3|edit|modify) ACTION="edit" ;;
+      4|delete) ACTION="delete" ;;
+      5|preset) ACTION="preset" ;;
+      6|exit|quit) exit 0 ;;
+      *) ACTION="view" ;;
+    esac
+  fi
+  case "$ACTION" in
+    add|install)
+      info "添加节点"
+      do_add
+      ;;
+    view|show|edit|modify|delete)
+      if [ ! -f /usr/local/etc/xray/config.json ]; then
+        echo "没有节点，请先选 1 添加节点"
+        if [ "$INTERACTIVE" = 1 ]; then
+          continue
+        else
+          exit 1
+        fi
+      fi
+      case "$ACTION" in
+        view|show) show_info ;;
+        edit|modify) edit_node ;;
+        delete) delete_node ;;
+      esac
+      ;;
+    preset)
+      if [ -f /usr/local/etc/xray/config.json ]; then
+        load_preset
+      elif load_preset; then
+        info "添加节点"
+        do_add
+      fi
+      ;;
+    traffic) traffic_status ;;
+    *) die "ACTION 无效：$ACTION" ;;
+  esac
+  [ "$INTERACTIVE" = 0 ] && exit 0
+done
