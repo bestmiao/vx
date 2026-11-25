@@ -105,18 +105,18 @@ ask() {
 
 sni_pool() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
-    hk|hongkong|香港) echo "www.apple.com www.microsoft.com www.google.com www.cloudflare.com" ;;
-    jp|japan|日本) echo "www.amazon.co.jp www.yahoo.co.jp www.rakuten.co.jp www.google.co.jp" ;;
-    sg|singapore|新加坡) echo "www.amazon.sg www.google.com.sg www.shopee.sg www.lazada.sg" ;;
-    us|usa|america|美国) echo "www.microsoft.com www.apple.com www.amazon.com www.google.com" ;;
-    *) echo "www.microsoft.com www.apple.com www.amazon.com www.google.com" ;;
+    hk|hongkong|香港) echo "www.hkust.edu.hk www.gov.hk www.hko.gov.hk www.hkpl.gov.hk" ;;
+    jp|japan|日本) echo "www.yahoo.co.jp www.rakuten.co.jp www.osaka-u.ac.jp www.kyushu-u.ac.jp" ;;
+    sg|singapore|新加坡) echo "www.shopee.sg www.lazada.sg www.mti.gov.sg www.acm.org.sg" ;;
+    us|usa|america|美国) echo "www.whitney.org www.okstate.edu www.oregonstate.edu www.ufl.edu" ;;
+    *) echo "www.hkust.edu.hk www.osaka-u.ac.jp www.mti.gov.sg www.whitney.org" ;;
   esac
 }
 region_to_sni() {
   local pool arr pick
   pool="$(sni_pool "$1")"
   arr=($pool)
-  [ "${#arr[@]}" -eq 0 ] && { printf '%s' "www.microsoft.com"; return 0; }
+  [ "${#arr[@]}" -eq 0 ] && { printf '%s' "www.hkust.edu.hk"; return 0; }
   pick="${arr[$((RANDOM % ${#arr[@]}))]}"
   printf '%s' "$pick"
 }
