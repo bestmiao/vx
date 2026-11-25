@@ -249,12 +249,19 @@ edit_node() {
     cur_sni="$(grep -i '^SNI' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
   fi
 
+  local cur_preset="custom"
+  if [ -f "$TQ_CONF" ]; then
+    cur_preset="$(grep '^TQ_PRESET=' "$TQ_CONF" 2>/dev/null | cut -d= -f2)"
+    case "$cur_preset" in gcp|cdt|custom) ;; *) cur_preset="custom" ;; esac
+  fi
+
   local cur_mode_label="Reality"
   [ "$cur_mode" = "tls" ] && cur_mode_label="TLS"
   echo ""
   echo "模式：$cur_mode_label"
   echo "端口：$cur_port"
   echo "SNI：$cur_sni"
+  echo "套餐：$(tq_preset_label "$cur_preset")"
   echo "空输入=保持原值"
   echo ""
 
@@ -281,16 +288,19 @@ edit_node() {
   fi
 
   new_sni="${REALITY_TARGET:-}"
+  local new_region="$cur_region" region_changed=0
   if [ "$cur_mode" = "reality" ]; then
     if [ -n "$new_sni" ]; then
       is_domain "$new_sni" || die "SNI 格式无效：$new_sni"
       REGION_LABEL="自定义"
+      new_region="custom"; region_changed=1
     elif [ -n "${REGION:-}" ]; then
       ask_region
       if [ "$REGION" = "$cur_region" ] && [ -n "$cur_region" ] && [ "$cur_region" != "custom" ]; then
         new_sni="$cur_sni"
       else
         new_sni="$REGION_SNI"
+        new_region="$REGION"; region_changed=1
       fi
     else
       echo "  1) 香港  2) 日本  3) 新加坡  4) 美国  5) 自定义"
@@ -302,6 +312,7 @@ edit_node() {
           new_sni="$cur_sni"
         else
           new_sni="$REGION_SNI"
+          new_region="$REGION"; region_changed=1
         fi
       else
         new_sni="$cur_sni"
@@ -312,12 +323,20 @@ edit_node() {
     new_sni="$cur_sni"
   fi
 
-  if [ -f "$TQ_CONF" ] && [ "$new_port" != "$cur_port" ]; then
+  local new_preset="$cur_preset"
+  if [ "$region_changed" = "1" ]; then
+    case "$cur_preset" in
+      gcp) [ "$new_region" != "us" ] && new_preset="custom" ;;
+      cdt) [ "$new_region" != "hk" ] && new_preset="custom" ;;
+    esac
+  fi
+  if [ -f "$TQ_CONF" ] && { [ "$new_port" != "$cur_port" ] || [ "$new_preset" != "$cur_preset" ]; }; then
     local env_tq_iface="${TQ_IFACE:-}"
     TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""; TQ_IFACE=""; TQ_PRESET=""
     . "$TQ_CONF"
     TQ_IFACE="${env_tq_iface:-${TQ_IFACE:-}}"
     TQ_PORT="$new_port"
+    TQ_PRESET="$new_preset"
     write_tq_conf
   fi
 
@@ -335,6 +354,9 @@ edit_node() {
   fi
   jq -e . "$config_file.tmp" >/dev/null || die "修改后的配置不是合法 JSON"
   mv "$config_file.tmp" "$config_file"
+  if [ "$cur_preset" = "gcp" ] && [ "$new_preset" = "custom" ]; then
+    apply_whitelist "$config_file" 0
+  fi
   xray run -test -config "$config_file" || die "配置校验失败"
   systemctl restart xray
   sleep 2
@@ -464,10 +486,42 @@ $f"
   echo "xray 和 BBR 保留。"
 }
 
+preset_create() {
+  local new_tq_preset preset_ans
+  new_tq_preset="${TQ_PRESET:-}"
+  if [ -n "$new_tq_preset" ]; then
+    new_tq_preset="$(norm_tq_preset "$new_tq_preset")" || die "套餐无效：$new_tq_preset"
+  else
+    echo "当前套餐：无"
+    echo "  1) GCP：180G / 总计 / 月 / 1日 / 阻断 / 美国 / 白名单仅谷歌系"
+    echo "  2) 阿里云CDT：180G / 最大值 / 月 / 1日 / 阻断 / 香港 / 无白名单"
+    preset_ans="$(ask "请选择 [1/2，0 返回]: " "0")"
+    case "$preset_ans" in
+      0|"") return 1 ;;
+      1) new_tq_preset=gcp ;;
+      2) new_tq_preset=cdt ;;
+      gcp|cdt) new_tq_preset="$preset_ans" ;;
+      *) die "套餐无效：$preset_ans" ;;
+    esac
+  fi
+  if [ "$new_tq_preset" = "gcp" ]; then
+    REGION=us
+    TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=180; TQ_RATE=0
+  elif [ "$new_tq_preset" = "cdt" ]; then
+    REGION=hk
+    TQ_MODE=max; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=180; TQ_RATE=0
+  fi
+  TQ_PRESET="$new_tq_preset"
+  return 0
+}
+
 load_preset() {
   local config_file="/usr/local/etc/xray/config.json"
   local info_file="$INFO_FILE"
-  [ -f "$config_file" ] || die "没有节点"
+  if [ ! -f "$config_file" ]; then
+    preset_create
+    return $?
+  fi
   command -v jq >/dev/null 2>&1 || die "需要 jq"
 
   local cur_mode cur_sni
@@ -1177,7 +1231,7 @@ if [ -z "$ACTION" ]; then
 fi
 case "$ACTION" in
   add|install) info "添加节点" ;;
-  view|show|edit|modify|delete|preset)
+  view|show|edit|modify|delete)
     if [ ! -f /usr/local/etc/xray/config.json ]; then
       echo "没有节点，请先选 1 添加节点"
       exit 1
@@ -1186,8 +1240,17 @@ case "$ACTION" in
       view|show) show_info; exit 0 ;;
       edit|modify) edit_node; exit 0 ;;
       delete) delete_node; exit 0 ;;
-      preset) load_preset; exit 0 ;;
     esac
+    ;;
+  preset)
+    if [ -f /usr/local/etc/xray/config.json ]; then
+      load_preset; exit 0
+    fi
+    if load_preset; then
+      info "添加节点"
+    else
+      exit 0
+    fi
     ;;
   traffic) traffic_status; exit 0 ;;
   *) die "ACTION 无效：$ACTION" ;;
@@ -1250,7 +1313,8 @@ esac
 SPLIT="${SPLIT:-1}"
 case "$SPLIT" in 1|[Yy]*) SPLIT=1 ;; *) SPLIT=0 ;; esac
 
-TQ_PRESET="custom"
+_preset_raw="${TQ_PRESET:-custom}"
+TQ_PRESET="$(norm_tq_preset "$_preset_raw")" || die "套餐无效：$_preset_raw"
 TQ_MODE="$(norm_tq_mode "${TQ_MODE:-total}")" || die "统计模式无效：$TQ_MODE"
 TQ_PERIOD="$(norm_tq_period "${TQ_PERIOD:-monthly}")" || die "统计周期无效：$TQ_PERIOD"
 TQ_START="${TQ_START:-1}"
@@ -1405,6 +1469,11 @@ if id xray >/dev/null 2>&1; then
     chgrp xray "$CERT_FILE" "$KEY_FILE" 2>/dev/null || true
     chmod 640 "$CERT_FILE" "$KEY_FILE" 2>/dev/null || true
   fi
+fi
+
+if [ "$TQ_PRESET" = "gcp" ]; then
+  ensure_geosite
+  apply_whitelist "$CONFIG_FILE" 1
 fi
 
 info "校验中..."
