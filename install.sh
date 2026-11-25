@@ -310,15 +310,17 @@ modify_node() {
 
   local env_tq_mode="${TQ_MODE:-}" env_tq_period="${TQ_PERIOD:-}" env_tq_start="${TQ_START:-}"
   local env_tq_limit="${TQ_LIMIT:-}" env_tq_quota="${TQ_QUOTA:-}" env_tq_rate="${TQ_RATE:-}"
+  local env_tq_iface="${TQ_IFACE:-}"
   local cur_tq_mode cur_tq_period cur_tq_start cur_tq_limit cur_tq_quota cur_tq_rate
   cur_tq_mode=total; cur_tq_period=monthly; cur_tq_start=1; cur_tq_limit=block; cur_tq_quota=0; cur_tq_rate=128000
   if [ -f "$TQ_CONF" ]; then
-    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""
+    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""; TQ_IFACE=""
     . "$TQ_CONF"
     cur_tq_mode="${TQ_MODE:-total}"; cur_tq_period="${TQ_PERIOD:-monthly}"; cur_tq_start="${TQ_START:-1}"
     cur_tq_limit="${TQ_LIMIT:-block}"; cur_tq_quota="${TQ_QUOTA:-0}"; cur_tq_rate="${TQ_RATE:-128000}"
   fi
-  echo "统计：$(tq_mode_label "$cur_tq_mode") / 周期：$(tq_period_label "$cur_tq_period") / 起始日：$cur_tq_start"
+  TQ_IFACE="${env_tq_iface:-${TQ_IFACE:-}}"
+  echo "统计：$(tq_mode_label "$cur_tq_mode") / 周期：$(tq_period_label "$cur_tq_period") / 起始日：$cur_tq_start / 范围：整机"
   if [ "$cur_tq_quota" = "0" ]; then
     echo "限制：$(tq_limit_label "$cur_tq_limit") / 限额：不限 / 限速：$(fmt_bytes "$cur_tq_rate")/s"
   else
@@ -466,6 +468,7 @@ write_tq_conf() {
     echo "TQ_QUOTA=$TQ_QUOTA"
     echo "TQ_RATE=$TQ_RATE"
     echo "TQ_PORT=$TQ_PORT"
+    echo "TQ_IFACE=${TQ_IFACE:-}"
   } > "$TQ_CONF.tmp"
   mv "$TQ_CONF.tmp" "$TQ_CONF"
   chmod 600 "$TQ_CONF"
@@ -524,6 +527,7 @@ write_outputs() {
       echo "手机扫链接只能导入上传腿，分流配置需手动导入。"
     fi
     echo "统计：$(tq_mode_label "${OUT_TQ_MODE:-total}")"
+    echo "范围：整机"
     echo "周期：$(tq_period_label "${OUT_TQ_PERIOD:-monthly}")"
     echo "起始日：${OUT_TQ_START:-1}"
     echo "限制：$(tq_limit_label "${OUT_TQ_LIMIT:-block}")"
@@ -648,10 +652,15 @@ SYSCTL
 
 install_traffic_watch() {
   mkdir -p /usr/local/bin /etc/systemd/system
+  if command -v iptables >/dev/null 2>&1 && [ -n "${TQ_PORT:-}" ]; then
+    iptables -D INPUT -p tcp --dport "$TQ_PORT" 2>/dev/null || true
+    iptables -D OUTPUT -p tcp --sport "$TQ_PORT" 2>/dev/null || true
+  fi
   cat > "$TQ_WATCH" <<'WATCHEOF'
 #!/usr/bin/env bash
 TQ_CONF="${TQ_CONF:-/usr/local/etc/xray/traffic.conf}"
 TQ_STATE="${TQ_STATE:-/usr/local/etc/xray/traffic.json}"
+TQ_SYSFS_ROOT="${TQ_SYSFS_ROOT:-/sys/class/net}"
 TQ_MODE=total
 TQ_PERIOD=monthly
 TQ_START=1
@@ -659,6 +668,7 @@ TQ_LIMIT=block
 TQ_QUOTA=0
 TQ_RATE=128000
 TQ_PORT=443
+TQ_IFACE="${TQ_IFACE:-}"
 IN=0
 OUT=0
 LAST_IN=0
@@ -669,12 +679,14 @@ S_MODE=""
 S_PERIOD=""
 S_START=0
 S_PORT=0
+S_SCOPE=""
 ENFORCED=""
 CUR_IN=0
 CUR_OUT=0
 COUNTED=0
 NOW=0
 IFACE=""
+READ_OK=0
 fmt_bytes() {
   local b=$1
   if [ "$b" -lt 1024 ]; then printf '%s B' "$b"; return 0; fi
@@ -731,10 +743,12 @@ period_bounds() {
   printf '%s %s' "$s" "$e"
 }
 load_conf() {
-  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=0; TQ_RATE=128000; TQ_PORT=443
+  local env_iface="${TQ_IFACE:-}"
+  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=0; TQ_RATE=128000; TQ_PORT=443; TQ_IFACE=""
   if [ -f "$TQ_CONF" ]; then
     . "$TQ_CONF"
   fi
+  [ -n "$TQ_IFACE" ] || TQ_IFACE="$env_iface"
   case "$TQ_MODE" in out|in|total|max) ;; *) TQ_MODE=total ;; esac
   case "$TQ_PERIOD" in monthly|quarterly|yearly) ;; *) TQ_PERIOD=monthly ;; esac
   case "$TQ_LIMIT" in block|throttle) ;; *) TQ_LIMIT=block ;; esac
@@ -745,7 +759,7 @@ load_conf() {
 }
 load_state() {
   IN=0; OUT=0; LAST_IN=0; LAST_OUT=0; P_START=0; P_END=0
-  S_MODE=""; S_PERIOD=""; S_START=0; S_PORT=0; ENFORCED=""
+  S_MODE=""; S_PERIOD=""; S_START=0; S_PORT=0; S_SCOPE=""; ENFORCED=""
   [ -f "$TQ_STATE" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
   IN=$(jq -r '.in // 0' "$TQ_STATE" 2>/dev/null || echo 0)
@@ -758,6 +772,7 @@ load_state() {
   S_PERIOD=$(jq -r '.period // ""' "$TQ_STATE" 2>/dev/null || echo "")
   S_START=$(jq -r '.start_day // 0' "$TQ_STATE" 2>/dev/null || echo 0)
   S_PORT=$(jq -r '.port // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  S_SCOPE=$(jq -r '.scope // ""' "$TQ_STATE" 2>/dev/null || echo "")
   ENFORCED=$(jq -r '.enforced // ""' "$TQ_STATE" 2>/dev/null || echo "")
   [[ "$IN" =~ ^[0-9]+$ ]] || IN=0
   [[ "$OUT" =~ ^[0-9]+$ ]] || OUT=0
@@ -774,29 +789,35 @@ save_state() {
     --argjson last_in "$LAST_IN" --argjson last_out "$LAST_OUT" \
     --argjson period_start "$P_START" --argjson period_end "$P_END" \
     --arg mode "$TQ_MODE" --arg period "$TQ_PERIOD" --argjson start_day "$TQ_START" \
-    --argjson port "$TQ_PORT" --arg enforced "$ENFORCED" \
+    --argjson port "$TQ_PORT" --arg enforced "$ENFORCED" --arg scope "${S_SCOPE:-host}" \
     '{in: $in, out: $out, last_in: $last_in, last_out: $last_out,
       period_start: $period_start, period_end: $period_end,
       mode: $mode, period: $period, start_day: $start_day,
-      port: $port, enforced: $enforced}' > "$TQ_STATE.tmp" 2>/dev/null || return 0
+      port: $port, enforced: $enforced, scope: $scope}' > "$TQ_STATE.tmp" 2>/dev/null || return 0
   mv "$TQ_STATE.tmp" "$TQ_STATE" 2>/dev/null || true
   chmod 600 "$TQ_STATE" 2>/dev/null || true
 }
-ensure_rules() {
+cleanup_old_rules() {
+  local p
   command -v iptables >/dev/null 2>&1 || return 0
-  iptables -C INPUT -p tcp --dport "$TQ_PORT" 2>/dev/null || iptables -A INPUT -p tcp --dport "$TQ_PORT" 2>/dev/null || true
-  iptables -C OUTPUT -p tcp --sport "$TQ_PORT" 2>/dev/null || iptables -A OUTPUT -p tcp --sport "$TQ_PORT" 2>/dev/null || true
+  for p in "$TQ_PORT" "$S_PORT"; do
+    case "$p" in ''|0) continue ;; esac
+    iptables -D INPUT -p tcp --dport "$p" 2>/dev/null || true
+    iptables -D OUTPUT -p tcp --sport "$p" 2>/dev/null || true
+  done
 }
 read_counters() {
-  local v
-  CUR_IN=0; CUR_OUT=0
-  command -v iptables >/dev/null 2>&1 || return 0
-  v=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v p="$TQ_PORT" '$0 ~ "dpt:"p"( |$)" {s += $2} END {print s+0}')
-  [[ "$v" =~ ^[0-9]+$ ]] && CUR_IN=$v
-  v=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v p="$TQ_PORT" '$0 ~ "spt:"p"( |$)" {s += $2} END {print s+0}')
-  [[ "$v" =~ ^[0-9]+$ ]] && CUR_OUT=$v
+  local rx tx
+  CUR_IN=0; CUR_OUT=0; READ_OK=0
+  detect_if
+  [ -n "$IFACE" ] || return 0
+  rx=$(cat "$TQ_SYSFS_ROOT/$IFACE/statistics/rx_bytes" 2>/dev/null || echo "")
+  tx=$(cat "$TQ_SYSFS_ROOT/$IFACE/statistics/tx_bytes" 2>/dev/null || echo "")
+  [[ "$rx" =~ ^[0-9]+$ ]] && [[ "$tx" =~ ^[0-9]+$ ]] || return 0
+  CUR_IN=$rx; CUR_OUT=$tx; READ_OK=1
 }
 detect_if() {
+  if [ -n "$TQ_IFACE" ] && [ -d "$TQ_SYSFS_ROOT/$TQ_IFACE/statistics" ]; then IFACE="$TQ_IFACE"; return 0; fi
   IFACE=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i == "dev") {print $(i+1); exit}}')
   [ -z "$IFACE" ] && IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
   [ -z "$IFACE" ] && IFACE="eth0"
@@ -838,23 +859,23 @@ counted_now() {
 run_watch() {
   load_conf
   NOW=$(date +%s)
-  ensure_rules
-  read_counters
   load_state
-  if [ "$S_MODE|$S_PERIOD|$S_START" != "$TQ_MODE|$TQ_PERIOD|$TQ_START" ] || [ "$P_END" -le "$NOW" ] || [ "$P_START" -eq 0 ]; then
+  read_counters
+  if [ "$READ_OK" != "1" ]; then
+    return 0
+  fi
+  if [ "$S_MODE|$S_PERIOD|$S_START" != "$TQ_MODE|$TQ_PERIOD|$TQ_START" ] || [ "$P_END" -le "$NOW" ] || [ "$P_START" -eq 0 ] || [ "$S_SCOPE" != "host" ]; then
     if [ "$ENFORCED" = "block" ]; then systemctl start xray 2>/dev/null || true; fi
     if [ "$ENFORCED" = "throttle" ]; then tc_clear; fi
+    if [ "$S_SCOPE" != "host" ]; then cleanup_old_rules; fi
     IN=0; OUT=0; ENFORCED=""
     read -r P_START P_END <<< "$(period_bounds "$NOW" "$TQ_PERIOD" "$TQ_START")"
     LAST_IN=$CUR_IN; LAST_OUT=$CUR_OUT; S_PORT=$TQ_PORT
   fi
-  if [ "$S_PORT" != "$TQ_PORT" ]; then
-    LAST_IN=$CUR_IN; LAST_OUT=$CUR_OUT; S_PORT=$TQ_PORT
-  fi
-  if [ "$CUR_IN" -ge "$LAST_IN" ]; then IN=$(( IN + CUR_IN - LAST_IN )); else IN=$(( IN + CUR_IN )); fi
-  if [ "$CUR_OUT" -ge "$LAST_OUT" ]; then OUT=$(( OUT + CUR_OUT - LAST_OUT )); else OUT=$(( OUT + CUR_OUT )); fi
+  if [ "$CUR_IN" -ge "$LAST_IN" ]; then IN=$(( IN + CUR_IN - LAST_IN )); fi
+  if [ "$CUR_OUT" -ge "$LAST_OUT" ]; then OUT=$(( OUT + CUR_OUT - LAST_OUT )); fi
   LAST_IN=$CUR_IN; LAST_OUT=$CUR_OUT
-  S_MODE=$TQ_MODE; S_PERIOD=$TQ_PERIOD; S_START=$TQ_START
+  S_MODE=$TQ_MODE; S_PERIOD=$TQ_PERIOD; S_START=$TQ_START; S_SCOPE="host"
   counted_now
   if [ "$TQ_QUOTA" -gt 0 ] && [ "$COUNTED" -ge "$TQ_QUOTA" ]; then
     if [ "$TQ_LIMIT" = "throttle" ]; then
@@ -906,6 +927,7 @@ show_status() {
     dstart=$P_START; dend=$P_END
   fi
   echo "统计：$(mode_label "$TQ_MODE")"
+  echo "范围：整机"
   echo "周期：$(period_label "$TQ_PERIOD")（$(period_desc "$TQ_PERIOD" "$TQ_START")）"
   echo "本周期：$(date -d "@$dstart" +%Y-%m-%d) 至 $(date -d "@$dend" +%Y-%m-%d)"
   echo "已用：$(fmt_bytes "$dcounted")（入站 $(fmt_bytes "$din") / 出站 $(fmt_bytes "$dout")）"
@@ -972,7 +994,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 if [ "$#" -gt 0 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
   echo "用法：sudo ./install.sh"
-  echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP TQ_MODE TQ_PERIOD TQ_START TQ_LIMIT TQ_QUOTA TQ_RATE"
+  echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP TQ_MODE TQ_PERIOD TQ_START TQ_LIMIT TQ_QUOTA TQ_RATE TQ_IFACE"
   exit 0
 fi
 if [ "$#" -gt 0 ] && [ "$1" = "--show-traffic" ]; then traffic_status; exit 0; fi
@@ -1086,6 +1108,7 @@ TQ_START="${TQ_START:-}"
 TQ_LIMIT="${TQ_LIMIT:-}"
 TQ_QUOTA="${TQ_QUOTA:-}"
 TQ_RATE="${TQ_RATE:-}"
+TQ_IFACE="${TQ_IFACE:-}"
 if [ -z "$TQ_QUOTA" ]; then
   TQ_QUOTA_ANS="$(ask "限额 [0=不限，如 180=180G，默认 0]: " "0")"
   TQ_QUOTA="$TQ_QUOTA_ANS"
