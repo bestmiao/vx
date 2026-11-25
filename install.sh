@@ -233,63 +233,38 @@ check_port_free() {
   fi
 }
 
-modify_node() {
+edit_node() {
   local config_file="/usr/local/etc/xray/config.json"
   local info_file="$INFO_FILE"
   [ -f "$config_file" ] || die "没有找到配置 $config_file"
   command -v jq >/dev/null 2>&1 || die "需要 jq"
 
-  local cur_port cur_uuid cur_path cur_mode cur_sni cur_priv cur_pub cur_sid cur_cert cur_key
-  cur_priv=""; cur_pub=""; cur_sid=""
-  local cur_split new_split split_ans
+  local cur_port cur_mode cur_sni
   cur_port="$(jq -r '.inbounds[0].port' "$config_file")"
-  cur_uuid="$(jq -r '.inbounds[0].settings.clients[0].id' "$config_file")"
-  cur_path="$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$config_file")"
   cur_mode="reality"
   if jq -e '.inbounds[0].streamSettings.security == "tls"' "$config_file" >/dev/null 2>&1; then cur_mode="tls"; fi
   if [ "$cur_mode" = "reality" ]; then
     cur_sni="$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$config_file")"
-    cur_priv="$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$config_file")"
-    cur_sid="$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$config_file")"
-    cur_pub="$(grep -iE '^(PublicKey|公钥)' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
   else
-    cur_sni="$(jq -r '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile' "$config_file")"
-    cur_cert="$(jq -r '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile' "$config_file")"
-    cur_key="$(jq -r '.inbounds[0].streamSettings.tlsSettings.certificates[0].keyFile' "$config_file")"
     cur_sni="$(grep -i '^SNI' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
   fi
-  cur_split=0
-  if grep -q '^分流：开' "$info_file" 2>/dev/null; then cur_split=1; fi
 
   local cur_mode_label="Reality"
   [ "$cur_mode" = "tls" ] && cur_mode_label="TLS"
   echo ""
   echo "模式：$cur_mode_label"
   echo "端口：$cur_port"
-  echo "UUID：$cur_uuid"
-  echo "路径：$cur_path"
   echo "SNI：$cur_sni"
-  if [ "$cur_split" = "1" ]; then echo "分流：开"; else echo "分流：关"; fi
   echo "空输入=保持原值"
   echo ""
 
-  local new_port new_uuid new_path new_sni new_region
+  local new_port new_sni
   new_port="${PORT:-}"
   if [ -z "$new_port" ]; then
     new_port="$(ask "新端口 [$cur_port]: " "$cur_port")"
   fi
   is_port "$new_port" || die "端口无效：$new_port"
   check_port_free "$new_port" "Xray"
-  new_uuid="${UUID:-}"
-  if [ -z "$new_uuid" ]; then
-    new_uuid="$(ask "新 UUID [$cur_uuid]: " "$cur_uuid")"
-  fi
-  is_uuid "$new_uuid" || die "UUID 格式无效：$new_uuid"
-  new_path="${XHTTP_PATH:-}"
-  if [ -z "$new_path" ]; then
-    new_path="$(ask "新路径 [$cur_path]: " "$cur_path")"
-  fi
-  is_path "$new_path" || die "路径无效：$new_path"
 
   local cur_region=""
   cur_region="$(grep -i '^地区' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' | tr -d ' \r\n' || true)"
@@ -337,22 +312,141 @@ modify_node() {
     new_sni="$cur_sni"
   fi
 
-  new_split="$cur_split"
-  if [ -n "${SPLIT:-}" ]; then
-    case "$SPLIT" in 1|[Yy]*) new_split=1 ;; *) new_split=0 ;; esac
-  else
-    split_ans="$(ask "分流 [1 开 / 0 关，当前 $cur_split，回车保持]: " "")"
-    case "$split_ans" in
-      1|[Yy]*|开) new_split=1 ;;
-      0|[Nn]*|关) new_split=0 ;;
-      "") ;;
-      *) die "分流无效：$split_ans" ;;
-    esac
+  if [ -f "$TQ_CONF" ] && [ "$new_port" != "$cur_port" ]; then
+    local env_tq_iface="${TQ_IFACE:-}"
+    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""; TQ_IFACE=""; TQ_PRESET=""
+    . "$TQ_CONF"
+    TQ_IFACE="${env_tq_iface:-${TQ_IFACE:-}}"
+    TQ_PORT="$new_port"
+    write_tq_conf
   fi
 
-  local env_tq_mode="${TQ_MODE:-}" env_tq_period="${TQ_PERIOD:-}" env_tq_start="${TQ_START:-}"
-  local env_tq_limit="${TQ_LIMIT:-}" env_tq_quota="${TQ_QUOTA:-}" env_tq_rate="${TQ_RATE:-}"
-  local env_tq_iface="${TQ_IFACE:-}" env_tq_preset="${TQ_PRESET:-}"
+  cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
+  if [ "$cur_mode" = "reality" ]; then
+    jq --argjson port "$new_port" --arg target "$new_sni" \
+      '.inbounds[0].port = $port
+       | .inbounds[0].streamSettings.realitySettings.target = ($target + ":443")
+       | .inbounds[0].streamSettings.realitySettings.serverNames = [$target]' \
+      "$config_file" > "$config_file.tmp"
+  else
+    jq --argjson port "$new_port" \
+      '.inbounds[0].port = $port' \
+      "$config_file" > "$config_file.tmp"
+  fi
+  jq -e . "$config_file.tmp" >/dev/null || die "修改后的配置不是合法 JSON"
+  mv "$config_file.tmp" "$config_file"
+  xray run -test -config "$config_file" || die "配置校验失败"
+  systemctl restart xray
+  sleep 2
+
+  refresh_outputs "$cur_mode" "$new_port" "$new_sni" "${REGION_LABEL:-}"
+  echo ""
+  cat "$info_file"
+}
+
+refresh_outputs() {
+  local r_mode="$1" r_port="$2" r_sni="$3" r_region="${4:-}"
+  local config_file="/usr/local/etc/xray/config.json"
+  local info_file="$INFO_FILE"
+  local r_uuid r_path r_pub r_sid r_priv r_split r_addr r_bbr
+  r_uuid="$(jq -r '.inbounds[0].settings.clients[0].id' "$config_file")"
+  r_path="$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$config_file")"
+  r_split=0
+  if grep -q '^分流：开' "$info_file" 2>/dev/null; then r_split=1; fi
+  r_pub=""; r_sid=""; r_priv=""
+  if [ "$r_mode" = "reality" ]; then
+    r_priv="$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$config_file")"
+    r_sid="$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$config_file")"
+    r_pub="$(grep -iE '^(PublicKey|公钥)' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
+    r_addr="$(grep '^落地地址：' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
+    [ -z "$r_addr" ] && r_addr="$(grep -i '^地址' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
+    if [ -z "$r_addr" ]; then
+      r_addr="$(curl -4s --max-time 8 https://api.ipify.org || echo "")"
+    fi
+    [ -n "$r_addr" ] || die "无法获取公网 IP（可用 PUBLIC_IP 指定）"
+    if [ -z "$r_region" ]; then
+      r_region="$(grep -i '^地区' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' | tr -d ' \r\n' || true)"
+    fi
+  else
+    r_addr="$r_sni"
+  fi
+  r_bbr="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)"
+  local c_mode c_period c_start c_limit c_quota c_rate c_preset
+  c_mode=total; c_period=monthly; c_start=1; c_limit=block; c_quota=0; c_rate=128000; c_preset=custom
+  if [ -f "$TQ_CONF" ]; then
+    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""; TQ_IFACE=""; TQ_PRESET=""
+    . "$TQ_CONF"
+    c_mode="${TQ_MODE:-total}"; c_period="${TQ_PERIOD:-monthly}"; c_start="${TQ_START:-1}"
+    c_limit="${TQ_LIMIT:-block}"; c_quota="${TQ_QUOTA:-0}"; c_rate="${TQ_RATE:-128000}"
+    c_preset="${TQ_PRESET:-custom}"
+  fi
+  OUT_MODE="$r_mode"
+  OUT_PORT="$r_port"
+  OUT_UUID="$r_uuid"
+  OUT_PATH="$r_path"
+  OUT_SNI="$r_sni"
+  OUT_PUB="$r_pub"
+  OUT_SID="$r_sid"
+  OUT_PRIV="$r_priv"
+  OUT_REGION_LABEL="$r_region"
+  OUT_BBR="$r_bbr"
+  OUT_SPLIT="$r_split"
+  OUT_TQ_MODE="$c_mode"; OUT_TQ_PERIOD="$c_period"; OUT_TQ_START="$c_start"
+  OUT_TQ_LIMIT="$c_limit"; OUT_TQ_QUOTA="$c_quota"; OUT_TQ_RATE="$c_rate"
+  OUT_TQ_PRESET="$c_preset"
+  OUT_B_ADDR="$r_addr"
+  OUT_ADDR="$r_addr"
+  write_outputs
+}
+
+delete_node() {
+  local config_file="/usr/local/etc/xray/config.json"
+  [ -f "$config_file" ] || die "没有节点"
+  echo "删除节点会停用 xray，删除配置和流量数据，xray 和 BBR 保留。"
+  local ans
+  ans="$(ask "确认删除？[y/N]: " "N")"
+  case "$ans" in
+    [Yy]|[Yy][Ee][Ss]) ;;
+    *) echo "已取消"; return 0 ;;
+  esac
+  [ -x "$TQ_WATCH" ] && "$TQ_WATCH" clear 2>/dev/null || true
+  systemctl stop xray 2>/dev/null || true
+  systemctl disable xray 2>/dev/null || true
+  systemctl disable --now traffic-watch.timer 2>/dev/null || true
+  local deleted="" f
+  for f in "$config_file" "$TQ_CONF" "$TQ_STATE" "$TQ_WATCH" \
+    /etc/systemd/system/traffic-watch.service /etc/systemd/system/traffic-watch.timer \
+    "$INFO_FILE" "$SPLIT_A_FILE" "$SPLIT_B_FILE"; do
+    if [ -e "$f" ]; then rm -f "$f"; deleted="$deleted
+$f"; fi
+  done
+  for f in "$config_file".bak.*; do
+    [ -e "$f" ] && rm -f "$f" && deleted="$deleted
+$f"
+  done
+  systemctl daemon-reload 2>/dev/null || true
+  echo "已删除：$deleted"
+  echo "xray 和 BBR 保留。"
+}
+
+load_preset() {
+  local config_file="/usr/local/etc/xray/config.json"
+  local info_file="$INFO_FILE"
+  [ -f "$config_file" ] || die "没有节点"
+  command -v jq >/dev/null 2>&1 || die "需要 jq"
+
+  local cur_mode cur_sni
+  cur_mode="reality"
+  if jq -e '.inbounds[0].streamSettings.security == "tls"' "$config_file" >/dev/null 2>&1; then cur_mode="tls"; fi
+  cur_sni=""
+  if [ "$cur_mode" = "reality" ]; then
+    cur_sni="$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$config_file")"
+  else
+    cur_sni="$(grep -i '^SNI' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
+  fi
+
+  local env_tq_iface="${TQ_IFACE:-}"
+  local env_tq_preset="${TQ_PRESET:-}"
   local cur_tq_mode cur_tq_period cur_tq_start cur_tq_limit cur_tq_quota cur_tq_rate cur_tq_preset
   cur_tq_mode=total; cur_tq_period=monthly; cur_tq_start=1; cur_tq_limit=block; cur_tq_quota=0; cur_tq_rate=128000
   cur_tq_preset=custom
@@ -365,99 +459,67 @@ modify_node() {
     case "$cur_tq_preset" in gcp|cdt|custom) ;; *) cur_tq_preset=custom ;; esac
   fi
   TQ_IFACE="${env_tq_iface:-${TQ_IFACE:-}}"
-  echo "套餐：$(tq_preset_label "$cur_tq_preset")"
-  [ "$cur_tq_preset" = "gcp" ] && echo "白名单：仅谷歌系"
-  echo "统计：$(tq_mode_label "$cur_tq_mode") / 周期：$(tq_period_label "$cur_tq_period") / 起始日：$cur_tq_start / 范围：整机"
-  if [ "$cur_tq_quota" = "0" ]; then
-    echo "限制：$(tq_limit_label "$cur_tq_limit") / 限额：不限 / 限速：$(fmt_bytes "$cur_tq_rate")/s"
-  else
-    echo "限制：$(tq_limit_label "$cur_tq_limit") / 限额：$(fmt_bytes "$cur_tq_quota") / 限速：$(fmt_bytes "$cur_tq_rate")/s"
-  fi
+
+  local rate_label
+  rate_label="$(fmt_bytes "$cur_tq_rate")/s"
 
   local new_tq_preset preset_ans
-  new_tq_preset="$env_tq_preset"
-  if [ -z "$new_tq_preset" ]; then
-    echo "  1) GCP配置  2) 阿里云CDT  3) 自定义"
-    preset_ans="$(ask "套餐 [1/2/3，当前 $(tq_preset_label "$cur_tq_preset")，回车保持]: " "")"
-    if [ -z "$preset_ans" ]; then new_tq_preset="$cur_tq_preset"; else new_tq_preset="$(norm_tq_preset "$preset_ans")" || die "套餐无效：$preset_ans"; fi
-  else
+  new_tq_preset="${env_tq_preset:-}"
+  if [ -n "$new_tq_preset" ]; then
     new_tq_preset="$(norm_tq_preset "$new_tq_preset")" || die "套餐无效：$new_tq_preset"
+  else
+    echo "当前套餐：$(tq_preset_label "$cur_tq_preset")"
+    echo "  1) GCP配置：180G / 总计 / 月 / 1日 / 阻断 / 限速 $rate_label / 美国 / 白名单仅谷歌系"
+    echo "  2) 阿里云CDT：180G / 最大值 / 月 / 1日 / 阻断 / 限速 $rate_label / 香港 / 无白名单"
+    preset_ans="$(ask "请选择 [1/2，0 返回]: " "0")"
+    case "$preset_ans" in
+      0|"") return 0 ;;
+      1) new_tq_preset=gcp ;;
+      2) new_tq_preset=cdt ;;
+      gcp|cdt) new_tq_preset="$preset_ans" ;;
+      *) die "套餐无效：$preset_ans" ;;
+    esac
   fi
+
+  local new_tq_mode new_tq_period new_tq_start new_tq_limit new_tq_quota new_tq_rate
+  new_tq_rate="$cur_tq_rate"
   if [ "$new_tq_preset" = "gcp" ]; then
-    env_tq_mode=total; env_tq_period=monthly; env_tq_start=1; env_tq_limit=block; env_tq_quota=180G
+    new_tq_mode=total; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320
   elif [ "$new_tq_preset" = "cdt" ]; then
-    env_tq_mode=max; env_tq_period=monthly; env_tq_start=1; env_tq_limit=block; env_tq_quota=180G
+    new_tq_mode=max; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320
+  else
+    new_tq_mode="$cur_tq_mode"; new_tq_period="$cur_tq_period"; new_tq_start="$cur_tq_start"
+    new_tq_limit="$cur_tq_limit"; new_tq_quota="$cur_tq_quota"
   fi
-  if [ "$new_tq_preset" != "custom" ]; then
-    env_tq_rate="${env_tq_rate:-$cur_tq_rate}"
-  fi
+
+  local new_sni new_region_label
+  new_sni="$cur_sni"
+  new_region_label=""
   if [ "$cur_mode" = "reality" ]; then
     if [ "$new_tq_preset" = "gcp" ]; then
-      REGION_LABEL="美国"
+      new_region_label="美国"
       if [ "$(sni_region "$new_sni")" != "us" ]; then
-        REGION=us; new_sni="$(region_to_sni us)"
+        new_sni="$(region_to_sni us)"
       fi
     elif [ "$new_tq_preset" = "cdt" ]; then
-      REGION_LABEL="香港"
+      new_region_label="香港"
       if [ "$(sni_region "$new_sni")" != "hk" ]; then
-        REGION=hk; new_sni="$(region_to_sni hk)"
+        new_sni="$(region_to_sni hk)"
       fi
+    else
+      new_region_label="$(grep -i '^地区' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' | tr -d ' \r\n' || true)"
     fi
   fi
   if [ "$new_tq_preset" = "gcp" ]; then
     ensure_geosite
   fi
 
-  local new_tq_mode new_tq_period new_tq_start new_tq_limit new_tq_quota new_tq_rate
-  new_tq_mode="$env_tq_mode"
-  if [ -z "$new_tq_mode" ]; then
-    new_tq_mode="$(ask "统计 [出站/入站/总计/最大值，回车保持]: " "")"
-    [ -z "$new_tq_mode" ] && new_tq_mode="$cur_tq_mode"
-  fi
-  new_tq_mode="$(norm_tq_mode "$new_tq_mode")" || die "统计模式无效：$new_tq_mode"
-  new_tq_period="$env_tq_period"
-  if [ -z "$new_tq_period" ]; then
-    new_tq_period="$(ask "周期 [月/季/年，回车保持]: " "")"
-    [ -z "$new_tq_period" ] && new_tq_period="$cur_tq_period"
-  fi
-  new_tq_period="$(norm_tq_period "$new_tq_period")" || die "统计周期无效：$new_tq_period"
-  new_tq_start="$env_tq_start"
-  if [ -z "$new_tq_start" ]; then
-    new_tq_start="$(ask "起始日 [1-28，回车保持]: " "")"
-    [ -z "$new_tq_start" ] && new_tq_start="$cur_tq_start"
-  fi
-  [[ "$new_tq_start" =~ ^[0-9]+$ ]] && [ "$new_tq_start" -ge 1 ] && [ "$new_tq_start" -le 28 ] || die "起始日无效：$new_tq_start，应为 1-28"
-  new_tq_limit="$env_tq_limit"
-  if [ -z "$new_tq_limit" ]; then
-    new_tq_limit="$(ask "限制 [阻断/限速，回车保持]: " "")"
-    [ -z "$new_tq_limit" ] && new_tq_limit="$cur_tq_limit"
-  fi
-  new_tq_limit="$(norm_tq_limit "$new_tq_limit")" || die "限制模式无效：$new_tq_limit"
-  new_tq_quota="$env_tq_quota"
-  if [ -z "$new_tq_quota" ]; then
-    new_tq_quota="$(ask "限额 [如 180=180G，0=不限，回车保持]: " "")"
-    if [ -z "$new_tq_quota" ]; then
-      new_tq_quota="$cur_tq_quota"
-      [[ "$new_tq_quota" =~ ^[0-9]+$ ]] || die "限额无效：$new_tq_quota"
-    else
-      new_tq_quota="$(parse_quota "$new_tq_quota")" || die "限额无效：$new_tq_quota"
-    fi
-  else
-    new_tq_quota="$(parse_quota "$new_tq_quota")" || die "限额无效：$new_tq_quota"
-  fi
-  new_tq_rate="$env_tq_rate"
-  if [ -z "$new_tq_rate" ]; then
-    new_tq_rate="$(ask "限速 [如 125K，回车保持]: " "")"
-    [ -z "$new_tq_rate" ] && new_tq_rate="$cur_tq_rate"
-  fi
-  new_tq_rate="$(parse_bytes "$new_tq_rate")" || die "限速值无效：$new_tq_rate"
-  if [ "$new_tq_limit" = "throttle" ] && [ "$new_tq_rate" -le 0 ]; then die "限速模式下限速值必须大于 0"; fi
-
   local old_tq_sig new_tq_sig
   old_tq_sig="$cur_tq_mode|$cur_tq_period|$cur_tq_start"
   new_tq_sig="$new_tq_mode|$new_tq_period|$new_tq_start"
   TQ_MODE="$new_tq_mode"; TQ_PERIOD="$new_tq_period"; TQ_START="$new_tq_start"
-  TQ_LIMIT="$new_tq_limit"; TQ_QUOTA="$new_tq_quota"; TQ_RATE="$new_tq_rate"; TQ_PORT="$new_port"
+  TQ_LIMIT="$new_tq_limit"; TQ_QUOTA="$new_tq_quota"; TQ_RATE="$new_tq_rate"
+  TQ_PORT="$(jq -r '.inbounds[0].port' "$config_file")"
   TQ_PRESET="$new_tq_preset"
   write_tq_conf
   if [ "$old_tq_sig" != "$new_tq_sig" ]; then
@@ -469,31 +531,16 @@ modify_node() {
       rm -f "$TQ_STATE"
     fi
   fi
-  if [ "$cur_port" != "$new_port" ]; then
-    iptables -D INPUT -p tcp --dport "$cur_port" 2>/dev/null || true
-    iptables -D OUTPUT -p tcp --sport "$cur_port" 2>/dev/null || true
-  fi
-  install_traffic_watch
 
-  cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
-  if [ "$cur_mode" = "reality" ]; then
-    jq --argjson port "$new_port" --arg uuid "$new_uuid" --arg path "$new_path" \
-       --arg target "$new_sni" --arg priv "$cur_priv" --arg sid "$cur_sid" \
-      '.inbounds[0].port = $port
-       | .inbounds[0].settings.clients[0].id = $uuid
-       | .inbounds[0].streamSettings.xhttpSettings.path = $path
-       | .inbounds[0].streamSettings.realitySettings.target = ($target + ":443")
+  if [ "$cur_mode" = "reality" ] && [ "$new_sni" != "$cur_sni" ]; then
+    cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
+    jq --arg target "$new_sni" \
+      '.inbounds[0].streamSettings.realitySettings.target = ($target + ":443")
        | .inbounds[0].streamSettings.realitySettings.serverNames = [$target]' \
       "$config_file" > "$config_file.tmp"
-  else
-    jq --argjson port "$new_port" --arg uuid "$new_uuid" --arg path "$new_path" \
-      '.inbounds[0].port = $port
-       | .inbounds[0].settings.clients[0].id = $uuid
-       | .inbounds[0].streamSettings.xhttpSettings.path = $path' \
-      "$config_file" > "$config_file.tmp"
+    jq -e . "$config_file.tmp" >/dev/null || die "修改后的配置不是合法 JSON"
+    mv "$config_file.tmp" "$config_file"
   fi
-  jq -e . "$config_file.tmp" >/dev/null || die "修改后的配置不是合法 JSON"
-  mv "$config_file.tmp" "$config_file"
   if [ "$new_tq_preset" = "gcp" ]; then
     apply_whitelist "$config_file" 1
   else
@@ -503,34 +550,7 @@ modify_node() {
   systemctl restart xray
   sleep 2
 
-  local b_addr
-  if [ "$cur_mode" = "reality" ]; then
-    b_addr="$(grep '^落地地址：' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
-    [ -z "$b_addr" ] && b_addr="$(grep -i '^地址' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
-    if [ -z "$b_addr" ]; then
-      b_addr="$(curl -4s --max-time 8 https://api.ipify.org || echo "")"
-    fi
-    [ -n "$b_addr" ] || die "无法获取公网 IP（可用 PUBLIC_IP 指定）"
-  else
-    b_addr="$new_sni"
-  fi
-  OUT_MODE="$cur_mode"
-  OUT_PORT="$new_port"
-  OUT_UUID="$new_uuid"
-  OUT_PATH="$new_path"
-  OUT_SNI="$new_sni"
-  OUT_PUB="$cur_pub"
-  OUT_SID="$cur_sid"
-  OUT_PRIV="$cur_priv"
-  OUT_REGION_LABEL="${REGION_LABEL:-}"
-  OUT_BBR="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)"
-  OUT_SPLIT="$new_split"
-  OUT_TQ_MODE="$new_tq_mode"; OUT_TQ_PERIOD="$new_tq_period"; OUT_TQ_START="$new_tq_start"
-  OUT_TQ_LIMIT="$new_tq_limit"; OUT_TQ_QUOTA="$new_tq_quota"; OUT_TQ_RATE="$new_tq_rate"
-  OUT_TQ_PRESET="$new_tq_preset"
-  OUT_B_ADDR="$b_addr"
-  OUT_ADDR="$b_addr"
-  write_outputs
+  refresh_outputs "$cur_mode" "$TQ_PORT" "$new_sni" "$new_region_label"
   [ -x "$TQ_WATCH" ] && "$TQ_WATCH" run 2>/dev/null || true
   echo ""
   cat "$info_file"
@@ -1091,6 +1111,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 if [ "$#" -gt 0 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
   echo "用法：sudo ./install.sh"
+  echo "动作：add view edit delete preset"
   echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP TQ_MODE TQ_PERIOD TQ_START TQ_LIMIT TQ_QUOTA TQ_RATE TQ_IFACE TQ_PRESET"
   exit 0
 fi
@@ -1113,25 +1134,34 @@ ACTION="${ACTION:-}"
 if [ -f /usr/local/etc/xray/config.json ] && command -v xray >/dev/null 2>&1; then
   if [ -z "$ACTION" ]; then
     echo ""
-    echo "  1) 修改配置"
-    echo "  2) 查看信息"
-    echo "  3) 重新安装"
-    ACTION="$(ask "请选择 [1/2/3，默认 1]: " "1")"
+    echo "  1) 添加节点"
+    echo "  2) 查看节点"
+    echo "  3) 编辑节点"
+    echo "  4) 删除节点"
+    echo "  5) 载入预设"
+    ACTION="$(ask "请选择 [1-5，默认 2]: " "2")"
     case "$ACTION" in
-      1|modify) ACTION="modify" ;;
-      2|show) ACTION="show" ;;
-      3|install) ACTION="install" ;;
-      *) ACTION="modify" ;;
+      1|add|install) ACTION="add" ;;
+      2|view|show) ACTION="view" ;;
+      3|edit|modify) ACTION="edit" ;;
+      4|delete) ACTION="delete" ;;
+      5|preset) ACTION="preset" ;;
+      *) ACTION="view" ;;
     esac
   fi
   case "$ACTION" in
-    modify) modify_node; exit 0 ;;
-    show) show_info; exit 0 ;;
+    add|install) info "添加节点" ;;
+    view|show) show_info; exit 0 ;;
+    edit|modify) edit_node; exit 0 ;;
+    delete) delete_node; exit 0 ;;
+    preset) load_preset; exit 0 ;;
     traffic) traffic_status; exit 0 ;;
-    install) info "重新安装" ;;
     *) die "ACTION 无效：$ACTION" ;;
   esac
 fi
+case "$ACTION" in
+  edit|modify|delete|preset) [ -f /usr/local/etc/xray/config.json ] || die "没有节点" ;;
+esac
 
 MODE="${MODE:-reality}"
 DOMAIN="${DOMAIN:-}"
@@ -1173,85 +1203,33 @@ while [ -z "$PORT" ] || ! is_port "$PORT"; do
 done
 check_port_free "$PORT" "Xray"
 
-while [ -z "$XHTTP_PATH" ] || ! is_path "$XHTTP_PATH"; do
-  [ -n "$XHTTP_PATH" ] && warn "路径无效：$XHTTP_PATH"
-  XHTTP_PATH="$(ask "路径 [默认 /api]: " "/api")"
-done
+XHTTP_PATH="${XHTTP_PATH:-/api}"
+is_path "$XHTTP_PATH" || die "路径无效：$XHTTP_PATH"
 
 if [ -n "$UUID" ] && ! is_uuid "$UUID"; then
   die "UUID 格式无效：$UUID"
 fi
 UUID="${UUID:-$(gen_uuid)}"
 
-if [ -z "$ENABLE_BBR" ]; then
-  ENABLE_BBR="$(ask "BBR [Y/n]: " "Y")"
-fi
+ENABLE_BBR="${ENABLE_BBR:-1}"
 case "$ENABLE_BBR" in
   1|[Yy]*|[Yy][Ee][Ss]) ENABLE_BBR=1 ;;
   *) ENABLE_BBR=0 ;;
 esac
 
-SPLIT="${SPLIT:-}"
-if [ -z "$SPLIT" ]; then
-  SPLIT_ANS="$(ask "分流 [Y/n]: " "Y")"
-  case "$SPLIT_ANS" in 0|[Nn]*) SPLIT=0 ;; *) SPLIT=1 ;; esac
-else
-  case "$SPLIT" in 1|[Yy]*) SPLIT=1 ;; *) SPLIT=0 ;; esac
-fi
+SPLIT="${SPLIT:-1}"
+case "$SPLIT" in 1|[Yy]*) SPLIT=1 ;; *) SPLIT=0 ;; esac
 
-TQ_MODE="${TQ_MODE:-}"
-TQ_PERIOD="${TQ_PERIOD:-}"
-TQ_START="${TQ_START:-}"
-TQ_LIMIT="${TQ_LIMIT:-}"
-TQ_QUOTA="${TQ_QUOTA:-}"
-TQ_RATE="${TQ_RATE:-}"
-TQ_IFACE="${TQ_IFACE:-}"
-TQ_PRESET="${TQ_PRESET:-}"
-cur_tq_preset=custom
-if [ -f "$TQ_CONF" ]; then
-  cur_tq_preset="$(grep '^TQ_PRESET=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || echo custom)"
-  case "$cur_tq_preset" in gcp|cdt|custom) ;; *) cur_tq_preset=custom ;; esac
-fi
-if [ -z "$TQ_PRESET" ]; then
-  echo "  1) GCP配置  2) 阿里云CDT  3) 自定义"
-  preset_ans="$(ask "套餐 [1/2/3，当前 $(tq_preset_label "$cur_tq_preset")，回车保持]: " "")"
-  if [ -z "$preset_ans" ]; then TQ_PRESET="$cur_tq_preset"; else TQ_PRESET="$(norm_tq_preset "$preset_ans")" || die "套餐无效：$preset_ans"; fi
-else
-  TQ_PRESET="$(norm_tq_preset "$TQ_PRESET")" || die "套餐无效：$TQ_PRESET"
-fi
-if [ "$TQ_PRESET" = "gcp" ]; then
-  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA="180G"
-  if [ "$MODE" = "reality" ]; then
-    REGION_LABEL="美国"
-    if [ "$(sni_region "$REALITY_TARGET")" != "us" ]; then
-      REGION=us; REGION_SNI="$(region_to_sni us)"; REALITY_TARGET="$REGION_SNI"
-    fi
-  fi
-elif [ "$TQ_PRESET" = "cdt" ]; then
-  TQ_MODE=max; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA="180G"
-  if [ "$MODE" = "reality" ]; then
-    REGION_LABEL="香港"
-    if [ "$(sni_region "$REALITY_TARGET")" != "hk" ]; then
-      REGION=hk; REGION_SNI="$(region_to_sni hk)"; REALITY_TARGET="$REGION_SNI"
-    fi
-  fi
-fi
-if [ -z "$TQ_QUOTA" ]; then
-  TQ_QUOTA_ANS="$(ask "限额 [0=不限，如 180=180G，默认 0]: " "0")"
-  TQ_QUOTA="$TQ_QUOTA_ANS"
-fi
-TQ_QUOTA="$(parse_quota "$TQ_QUOTA")" || die "限额无效：$TQ_QUOTA"
-if [ "$TQ_QUOTA" -gt 0 ] && [ -z "$TQ_LIMIT" ]; then
-  TQ_LIMIT_ANS="$(ask "限制 [1 阻断 / 2 限速，默认 1]: " "1")"
-  case "$TQ_LIMIT_ANS" in 2|throttle|限速) TQ_LIMIT=throttle ;; *) TQ_LIMIT=block ;; esac
-fi
+TQ_PRESET="custom"
 TQ_MODE="$(norm_tq_mode "${TQ_MODE:-total}")" || die "统计模式无效：$TQ_MODE"
 TQ_PERIOD="$(norm_tq_period "${TQ_PERIOD:-monthly}")" || die "统计周期无效：$TQ_PERIOD"
-[ -z "$TQ_START" ] && TQ_START=1
+TQ_START="${TQ_START:-1}"
 [[ "$TQ_START" =~ ^[0-9]+$ ]] && [ "$TQ_START" -ge 1 ] && [ "$TQ_START" -le 28 ] || die "起始日无效：$TQ_START，应为 1-28"
 TQ_LIMIT="$(norm_tq_limit "${TQ_LIMIT:-block}")" || die "限制模式无效：$TQ_LIMIT"
+TQ_QUOTA="$(parse_quota "${TQ_QUOTA:-0}")" || die "限额无效：$TQ_QUOTA"
 TQ_RATE="$(parse_bytes "${TQ_RATE:-125K}")" || die "限速值无效：$TQ_RATE"
 if [ "$TQ_LIMIT" = "throttle" ] && [ "$TQ_RATE" -le 0 ]; then die "限速模式下限速值必须大于 0"; fi
+TQ_IFACE="${TQ_IFACE:-}"
 
 if [ "$MODE" = "reality" ]; then MODE_LABEL="Reality"; else MODE_LABEL="TLS"; fi
 echo ""
@@ -1288,10 +1266,6 @@ if ! command -v xray >/dev/null 2>&1; then
   command -v xray >/dev/null 2>&1 || die "安装失败，未找到 xray"
 else
   info "已安装：$(xray version 2>/dev/null | head -n 1 || echo 未知版本)"
-fi
-
-if [ "$TQ_PRESET" = "gcp" ]; then
-  ensure_geosite
 fi
 
 CERT_FILE=""
@@ -1393,9 +1367,6 @@ jq -n \
   }' > "$CONFIG_FILE.tmp"
 jq -e . "$CONFIG_FILE.tmp" >/dev/null || die "配置不是合法 JSON"
 mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-if [ "$TQ_PRESET" = "gcp" ]; then
-  apply_whitelist "$CONFIG_FILE" 1
-fi
 
 if id xray >/dev/null 2>&1; then
   chgrp xray "$CONFIG_FILE" 2>/dev/null || true
