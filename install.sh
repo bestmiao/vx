@@ -23,6 +23,70 @@ gen_uuid() {
   printf '%s-%s-4%s-8%s-%s\n' "${hex:0:8}" "${hex:8:4}" "${hex:13:3}" "${hex:17:3}" "${hex:20:12}"
 }
 
+parse_bytes() {
+  local s mult=1
+  s="$(printf '%s' "$1" | tr -d ' \t\r\n')"
+  [ -z "$s" ] && { echo 0; return 0; }
+  case "$s" in
+    *K|*k) mult=1024; s="${s%?}" ;;
+    *M|*m) mult=1048576; s="${s%?}" ;;
+    *G|*g) mult=1073741824; s="${s%?}" ;;
+    *T|*t) mult=1099511627776; s="${s%?}" ;;
+  esac
+  [[ "$s" =~ ^[0-9]+$ ]] || return 1
+  echo $(( s * mult ))
+}
+
+fmt_bytes() {
+  local b=$1
+  if [ "$b" -lt 1024 ]; then printf '%s B' "$b"; return 0; fi
+  awk -v b="$b" 'BEGIN {
+    if (b < 1048576) printf "%.2f KB", b/1024;
+    else if (b < 1073741824) printf "%.2f MB", b/1048576;
+    else if (b < 1099511627776) printf "%.2f GB", b/1073741824;
+    else printf "%.2f TB", b/1099511627776;
+  }'
+}
+
+norm_tq_mode() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    out|outbound|出站) echo out ;;
+    in|inbound|入站) echo in ;;
+    total|总计|"") echo total ;;
+    max|最大值) echo max ;;
+    *) return 1 ;;
+  esac
+}
+
+norm_tq_period() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    monthly|month|月|"") echo monthly ;;
+    quarterly|quarter|季) echo quarterly ;;
+    yearly|year|年) echo yearly ;;
+    *) return 1 ;;
+  esac
+}
+
+norm_tq_limit() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    block|阻断|"") echo block ;;
+    throttle|tc|限速|tc限速) echo throttle ;;
+    *) return 1 ;;
+  esac
+}
+
+tq_mode_label() {
+  case "$1" in out) echo 出站;; in) echo 入站;; max) echo 最大值;; *) echo 总计;; esac
+}
+
+tq_period_label() {
+  case "$1" in quarterly) echo 季;; yearly) echo 年;; *) echo 月;; esac
+}
+
+tq_limit_label() {
+  case "$1" in throttle) echo 限速;; *) echo 阻断;; esac
+}
+
 ask() {
   local prompt="$1" default="$2" ans=""
   read -rp "$prompt" ans || true
@@ -185,6 +249,83 @@ modify_node() {
     esac
   fi
 
+  local env_tq_mode="${TQ_MODE:-}" env_tq_period="${TQ_PERIOD:-}" env_tq_start="${TQ_START:-}"
+  local env_tq_limit="${TQ_LIMIT:-}" env_tq_quota="${TQ_QUOTA:-}" env_tq_rate="${TQ_RATE:-}"
+  local cur_tq_mode cur_tq_period cur_tq_start cur_tq_limit cur_tq_quota cur_tq_rate
+  cur_tq_mode=total; cur_tq_period=monthly; cur_tq_start=1; cur_tq_limit=block; cur_tq_quota=0; cur_tq_rate=128000
+  if [ -f "$TQ_CONF" ]; then
+    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""
+    . "$TQ_CONF"
+    cur_tq_mode="${TQ_MODE:-total}"; cur_tq_period="${TQ_PERIOD:-monthly}"; cur_tq_start="${TQ_START:-1}"
+    cur_tq_limit="${TQ_LIMIT:-block}"; cur_tq_quota="${TQ_QUOTA:-0}"; cur_tq_rate="${TQ_RATE:-128000}"
+  fi
+  echo "统计：$(tq_mode_label "$cur_tq_mode") / 周期：$(tq_period_label "$cur_tq_period") / 起始日：$cur_tq_start"
+  if [ "$cur_tq_quota" = "0" ]; then
+    echo "限制：$(tq_limit_label "$cur_tq_limit") / 限额：不限 / 限速：$(fmt_bytes "$cur_tq_rate")/s"
+  else
+    echo "限制：$(tq_limit_label "$cur_tq_limit") / 限额：$(fmt_bytes "$cur_tq_quota") / 限速：$(fmt_bytes "$cur_tq_rate")/s"
+  fi
+
+  local new_tq_mode new_tq_period new_tq_start new_tq_limit new_tq_quota new_tq_rate
+  new_tq_mode="$env_tq_mode"
+  if [ -z "$new_tq_mode" ]; then
+    new_tq_mode="$(ask "统计 [out/in/total/max，回车保持]: " "")"
+    [ -z "$new_tq_mode" ] && new_tq_mode="$cur_tq_mode"
+  fi
+  new_tq_mode="$(norm_tq_mode "$new_tq_mode")" || die "统计模式无效：$new_tq_mode"
+  new_tq_period="$env_tq_period"
+  if [ -z "$new_tq_period" ]; then
+    new_tq_period="$(ask "周期 [monthly/quarterly/yearly，回车保持]: " "")"
+    [ -z "$new_tq_period" ] && new_tq_period="$cur_tq_period"
+  fi
+  new_tq_period="$(norm_tq_period "$new_tq_period")" || die "统计周期无效：$new_tq_period"
+  new_tq_start="$env_tq_start"
+  if [ -z "$new_tq_start" ]; then
+    new_tq_start="$(ask "起始日 [1-28，回车保持]: " "")"
+    [ -z "$new_tq_start" ] && new_tq_start="$cur_tq_start"
+  fi
+  [[ "$new_tq_start" =~ ^[0-9]+$ ]] && [ "$new_tq_start" -ge 1 ] && [ "$new_tq_start" -le 28 ] || die "起始日无效：$new_tq_start，应为 1-28"
+  new_tq_limit="$env_tq_limit"
+  if [ -z "$new_tq_limit" ]; then
+    new_tq_limit="$(ask "限制 [block/throttle，回车保持]: " "")"
+    [ -z "$new_tq_limit" ] && new_tq_limit="$cur_tq_limit"
+  fi
+  new_tq_limit="$(norm_tq_limit "$new_tq_limit")" || die "限制模式无效：$new_tq_limit"
+  new_tq_quota="$env_tq_quota"
+  if [ -z "$new_tq_quota" ]; then
+    new_tq_quota="$(ask "限额 [如 500G，0=不限，回车保持]: " "")"
+    [ -z "$new_tq_quota" ] && new_tq_quota="$cur_tq_quota"
+  fi
+  new_tq_quota="$(parse_bytes "$new_tq_quota")" || die "限额无效：$new_tq_quota"
+  new_tq_rate="$env_tq_rate"
+  if [ -z "$new_tq_rate" ]; then
+    new_tq_rate="$(ask "限速 [如 125K，回车保持]: " "")"
+    [ -z "$new_tq_rate" ] && new_tq_rate="$cur_tq_rate"
+  fi
+  new_tq_rate="$(parse_bytes "$new_tq_rate")" || die "限速值无效：$new_tq_rate"
+  if [ "$new_tq_limit" = "throttle" ] && [ "$new_tq_rate" -le 0 ]; then die "限速模式下限速值必须大于 0"; fi
+
+  local old_tq_sig new_tq_sig
+  old_tq_sig="$cur_tq_mode|$cur_tq_period|$cur_tq_start"
+  new_tq_sig="$new_tq_mode|$new_tq_period|$new_tq_start"
+  TQ_MODE="$new_tq_mode"; TQ_PERIOD="$new_tq_period"; TQ_START="$new_tq_start"
+  TQ_LIMIT="$new_tq_limit"; TQ_QUOTA="$new_tq_quota"; TQ_RATE="$new_tq_rate"; TQ_PORT="$new_port"
+  write_tq_conf
+  if [ "$old_tq_sig" != "$new_tq_sig" ]; then
+    if [ -f "$TQ_STATE" ]; then
+      local tq_enf
+      tq_enf="$(jq -r '.enforced // ""' "$TQ_STATE" 2>/dev/null || echo "")"
+      [ "$tq_enf" = "block" ] && systemctl start xray 2>/dev/null || true
+      if [ "$tq_enf" = "throttle" ]; then [ -x "$TQ_WATCH" ] && "$TQ_WATCH" clear 2>/dev/null || true; fi
+      rm -f "$TQ_STATE"
+    fi
+  fi
+  if [ "$cur_port" != "$new_port" ]; then
+    iptables -D INPUT -p tcp --dport "$cur_port" 2>/dev/null || true
+    iptables -D OUTPUT -p tcp --sport "$cur_port" 2>/dev/null || true
+  fi
+  install_traffic_watch
+
   cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
   if [ "$cur_mode" = "reality" ]; then
     jq --argjson port "$new_port" --arg uuid "$new_uuid" --arg path "$new_path" \
@@ -230,9 +371,12 @@ modify_node() {
   OUT_REGION_LABEL="${REGION_LABEL:-}"
   OUT_BBR="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)"
   OUT_SPLIT="$new_split"
+  OUT_TQ_MODE="$new_tq_mode"; OUT_TQ_PERIOD="$new_tq_period"; OUT_TQ_START="$new_tq_start"
+  OUT_TQ_LIMIT="$new_tq_limit"; OUT_TQ_QUOTA="$new_tq_quota"; OUT_TQ_RATE="$new_tq_rate"
   OUT_B_ADDR="$b_addr"
   OUT_ADDR="$b_addr"
   write_outputs
+  [ -x "$TQ_WATCH" ] && "$TQ_WATCH" run 2>/dev/null || true
   echo ""
   cat "$info_file"
 }
@@ -243,11 +387,39 @@ show_info() {
   else
     die "没有找到信息文件"
   fi
+  echo ""
+  traffic_status
+}
+
+write_tq_conf() {
+  mkdir -p "$(dirname "$TQ_CONF")"
+  {
+    echo "TQ_MODE=$TQ_MODE"
+    echo "TQ_PERIOD=$TQ_PERIOD"
+    echo "TQ_START=$TQ_START"
+    echo "TQ_LIMIT=$TQ_LIMIT"
+    echo "TQ_QUOTA=$TQ_QUOTA"
+    echo "TQ_RATE=$TQ_RATE"
+    echo "TQ_PORT=$TQ_PORT"
+  } > "$TQ_CONF.tmp"
+  mv "$TQ_CONF.tmp" "$TQ_CONF"
+  chmod 600 "$TQ_CONF"
+}
+
+traffic_status() {
+  if [ -x "$TQ_WATCH" ]; then
+    "$TQ_WATCH" status
+  else
+    echo "流量：无数据"
+  fi
 }
 
 INFO_FILE="/root/install-info.txt"
 SPLIT_A_FILE="/root/split-a.json"
 SPLIT_B_FILE="/root/split-b.json"
+TQ_CONF="/usr/local/etc/xray/traffic.conf"
+TQ_STATE="/usr/local/etc/xray/traffic.json"
+TQ_WATCH="/usr/local/bin/traffic-watch"
 
 write_outputs() {
   local mode_num encoded_path base_link
@@ -286,6 +458,13 @@ write_outputs() {
       echo "单机分离：上传、下载同一地址，防关联弱于双机；速度为本地速度，无跨地区延迟。"
       echo "手机扫链接只能导入上传腿，分流配置需手动导入。"
     fi
+    echo "统计：$(tq_mode_label "${OUT_TQ_MODE:-total}")"
+    echo "周期：$(tq_period_label "${OUT_TQ_PERIOD:-monthly}")"
+    echo "起始日：${OUT_TQ_START:-1}"
+    echo "限制：$(tq_limit_label "${OUT_TQ_LIMIT:-block}")"
+    if [ "${OUT_TQ_QUOTA:-0}" = "0" ]; then echo "限额：不限"; else echo "限额：$(fmt_bytes "${OUT_TQ_QUOTA}")"; fi
+    echo "限速：$(fmt_bytes "${OUT_TQ_RATE:-128000}")/s"
+    echo "流量文件：$TQ_STATE"
     echo "链接："
     echo "$OUT_LINK"
   } > "$INFO_FILE"
@@ -402,14 +581,336 @@ SYSCTL
   fi
 }
 
+install_traffic_watch() {
+  mkdir -p /usr/local/bin /etc/systemd/system
+  cat > "$TQ_WATCH" <<'WATCHEOF'
+#!/usr/bin/env bash
+TQ_CONF="${TQ_CONF:-/usr/local/etc/xray/traffic.conf}"
+TQ_STATE="${TQ_STATE:-/usr/local/etc/xray/traffic.json}"
+TQ_MODE=total
+TQ_PERIOD=monthly
+TQ_START=1
+TQ_LIMIT=block
+TQ_QUOTA=0
+TQ_RATE=128000
+TQ_PORT=443
+IN=0
+OUT=0
+LAST_IN=0
+LAST_OUT=0
+P_START=0
+P_END=0
+S_MODE=""
+S_PERIOD=""
+S_START=0
+S_PORT=0
+ENFORCED=""
+CUR_IN=0
+CUR_OUT=0
+COUNTED=0
+NOW=0
+IFACE=""
+fmt_bytes() {
+  local b=$1
+  if [ "$b" -lt 1024 ]; then printf '%s B' "$b"; return 0; fi
+  awk -v b="$b" 'BEGIN {
+    if (b < 1048576) printf "%.2f KB", b/1024;
+    else if (b < 1073741824) printf "%.2f MB", b/1048576;
+    else if (b < 1099511627776) printf "%.2f GB", b/1073741824;
+    else printf "%.2f TB", b/1099511627776;
+  }'
+}
+dim() {
+  date -d "$1-$2-01 +1 month -1 day" +%d
+}
+anchor_epoch() {
+  local y=$1 m=$2 d=$3 last
+  last=$(dim "$y" "$m")
+  [ "$d" -gt "$last" ] && d=$last
+  date -d "$y-$m-01 +$((d - 1)) days" +%s
+}
+add_months() {
+  local total=$(( $1 * 12 + $2 - 1 + $3 ))
+  printf '%s %s' "$(( total / 12 ))" "$(( total % 12 + 1 ))"
+}
+period_bounds() {
+  local now=$1 period=$2 d=$3 y m s e qm
+  y=$(date -d "@$now" +%Y)
+  m=$(date -d "@$now" +%m); m=$((10#$m))
+  case "$period" in
+    quarterly)
+      qm=$(( (m - 1) / 3 * 3 + 1 ))
+      s=$(anchor_epoch "$y" "$qm" "$d")
+      if [ "$s" -gt "$now" ]; then
+        read -r y qm <<< "$(add_months "$y" "$qm" -3)"
+        s=$(anchor_epoch "$y" "$qm" "$d")
+      fi
+      read -r y qm <<< "$(add_months "$y" "$qm" 3)"
+      e=$(anchor_epoch "$y" "$qm" "$d")
+      ;;
+    yearly)
+      s=$(anchor_epoch "$y" 1 "$d")
+      if [ "$s" -gt "$now" ]; then s=$(anchor_epoch "$((y - 1))" 1 "$d"); fi
+      e=$(anchor_epoch "$(( $(date -d "@$s" +%Y) + 1 ))" 1 "$d")
+      ;;
+    *)
+      s=$(anchor_epoch "$y" "$m" "$d")
+      if [ "$s" -gt "$now" ]; then
+        read -r y m <<< "$(add_months "$y" "$m" -1)"
+        s=$(anchor_epoch "$y" "$m" "$d")
+      fi
+      read -r y m <<< "$(add_months "$y" "$m" 1)"
+      e=$(anchor_epoch "$y" "$m" "$d")
+      ;;
+  esac
+  printf '%s %s' "$s" "$e"
+}
+load_conf() {
+  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=0; TQ_RATE=128000; TQ_PORT=443
+  if [ -f "$TQ_CONF" ]; then
+    . "$TQ_CONF"
+  fi
+  case "$TQ_MODE" in out|in|total|max) ;; *) TQ_MODE=total ;; esac
+  case "$TQ_PERIOD" in monthly|quarterly|yearly) ;; *) TQ_PERIOD=monthly ;; esac
+  case "$TQ_LIMIT" in block|throttle) ;; *) TQ_LIMIT=block ;; esac
+  [[ "$TQ_START" =~ ^[0-9]+$ ]] && [ "$TQ_START" -ge 1 ] && [ "$TQ_START" -le 28 ] || TQ_START=1
+  [[ "$TQ_QUOTA" =~ ^[0-9]+$ ]] || TQ_QUOTA=0
+  [[ "$TQ_RATE" =~ ^[0-9]+$ ]] || TQ_RATE=128000
+  [[ "$TQ_PORT" =~ ^[0-9]+$ ]] || TQ_PORT=443
+}
+load_state() {
+  IN=0; OUT=0; LAST_IN=0; LAST_OUT=0; P_START=0; P_END=0
+  S_MODE=""; S_PERIOD=""; S_START=0; S_PORT=0; ENFORCED=""
+  [ -f "$TQ_STATE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  IN=$(jq -r '.in // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  OUT=$(jq -r '.out // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  LAST_IN=$(jq -r '.last_in // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  LAST_OUT=$(jq -r '.last_out // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  P_START=$(jq -r '.period_start // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  P_END=$(jq -r '.period_end // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  S_MODE=$(jq -r '.mode // ""' "$TQ_STATE" 2>/dev/null || echo "")
+  S_PERIOD=$(jq -r '.period // ""' "$TQ_STATE" 2>/dev/null || echo "")
+  S_START=$(jq -r '.start_day // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  S_PORT=$(jq -r '.port // 0' "$TQ_STATE" 2>/dev/null || echo 0)
+  ENFORCED=$(jq -r '.enforced // ""' "$TQ_STATE" 2>/dev/null || echo "")
+  [[ "$IN" =~ ^[0-9]+$ ]] || IN=0
+  [[ "$OUT" =~ ^[0-9]+$ ]] || OUT=0
+  [[ "$LAST_IN" =~ ^[0-9]+$ ]] || LAST_IN=0
+  [[ "$LAST_OUT" =~ ^[0-9]+$ ]] || LAST_OUT=0
+  [[ "$P_START" =~ ^[0-9]+$ ]] || P_START=0
+  [[ "$P_END" =~ ^[0-9]+$ ]] || P_END=0
+}
+save_state() {
+  command -v jq >/dev/null 2>&1 || return 0
+  mkdir -p "$(dirname "$TQ_STATE")" 2>/dev/null || true
+  jq -n \
+    --argjson in "$IN" --argjson out "$OUT" \
+    --argjson last_in "$LAST_IN" --argjson last_out "$LAST_OUT" \
+    --argjson period_start "$P_START" --argjson period_end "$P_END" \
+    --arg mode "$TQ_MODE" --arg period "$TQ_PERIOD" --argjson start_day "$TQ_START" \
+    --argjson port "$TQ_PORT" --arg enforced "$ENFORCED" \
+    '{in: $in, out: $out, last_in: $last_in, last_out: $last_out,
+      period_start: $period_start, period_end: $period_end,
+      mode: $mode, period: $period, start_day: $start_day,
+      port: $port, enforced: $enforced}' > "$TQ_STATE.tmp" 2>/dev/null || return 0
+  mv "$TQ_STATE.tmp" "$TQ_STATE" 2>/dev/null || true
+  chmod 600 "$TQ_STATE" 2>/dev/null || true
+}
+ensure_rules() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -C INPUT -p tcp --dport "$TQ_PORT" 2>/dev/null || iptables -A INPUT -p tcp --dport "$TQ_PORT" 2>/dev/null || true
+  iptables -C OUTPUT -p tcp --sport "$TQ_PORT" 2>/dev/null || iptables -A OUTPUT -p tcp --sport "$TQ_PORT" 2>/dev/null || true
+}
+read_counters() {
+  local v
+  CUR_IN=0; CUR_OUT=0
+  command -v iptables >/dev/null 2>&1 || return 0
+  v=$(iptables -L INPUT -v -n -x 2>/dev/null | awk -v p="$TQ_PORT" '$0 ~ "dpt:"p"( |$)" {s += $2} END {print s+0}')
+  [[ "$v" =~ ^[0-9]+$ ]] && CUR_IN=$v
+  v=$(iptables -L OUTPUT -v -n -x 2>/dev/null | awk -v p="$TQ_PORT" '$0 ~ "spt:"p"( |$)" {s += $2} END {print s+0}')
+  [[ "$v" =~ ^[0-9]+$ ]] && CUR_OUT=$v
+}
+detect_if() {
+  IFACE=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i == "dev") {print $(i+1); exit}}')
+  [ -z "$IFACE" ] && IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+  [ -z "$IFACE" ] && IFACE="eth0"
+}
+tc_present() {
+  detect_if
+  command -v tc >/dev/null 2>&1 || return 1
+  tc qdisc show dev "$IFACE" 2>/dev/null | grep -q "htb 1:"
+}
+tc_apply() {
+  command -v tc >/dev/null 2>&1 || return 0
+  detect_if
+  local kbit=$(( TQ_RATE * 8 / 1024 ))
+  [ "$kbit" -lt 8 ] && kbit=8
+  tc qdisc replace dev "$IFACE" root handle 1: htb default 30 2>/dev/null || return 0
+  tc class replace dev "$IFACE" parent 1: classid 1:1 htb rate 10000mbit 2>/dev/null || true
+  tc class replace dev "$IFACE" parent 1:1 classid 1:10 htb rate "${kbit}kbit" ceil "${kbit}kbit" 2>/dev/null || true
+  tc class replace dev "$IFACE" parent 1:1 classid 1:30 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
+  tc qdisc replace dev "$IFACE" parent 1:10 handle 10: fq 2>/dev/null || true
+  tc qdisc replace dev "$IFACE" parent 1:30 handle 30: fq 2>/dev/null || true
+  tc filter replace dev "$IFACE" parent 1: protocol ip prio 1 u32 match ip sport "$TQ_PORT" 0xffff flowid 1:10 2>/dev/null || true
+  tc qdisc replace dev "$IFACE" handle ffff: ingress 2>/dev/null || true
+  tc filter replace dev "$IFACE" parent ffff: protocol ip prio 1 u32 match ip dport "$TQ_PORT" 0xffff police rate "${kbit}kbit" burst 64kbit drop 2>/dev/null || true
+}
+tc_clear() {
+  command -v tc >/dev/null 2>&1 || return 0
+  detect_if
+  tc qdisc del dev "$IFACE" root 2>/dev/null || true
+  tc qdisc del dev "$IFACE" handle ffff: ingress 2>/dev/null || true
+}
+counted_now() {
+  case "$TQ_MODE" in
+    out) COUNTED=$OUT ;;
+    in) COUNTED=$IN ;;
+    max) [ "$IN" -gt "$OUT" ] && COUNTED=$IN || COUNTED=$OUT ;;
+    *) COUNTED=$(( IN + OUT )) ;;
+  esac
+}
+run_watch() {
+  load_conf
+  NOW=$(date +%s)
+  ensure_rules
+  read_counters
+  load_state
+  if [ "$S_MODE|$S_PERIOD|$S_START" != "$TQ_MODE|$TQ_PERIOD|$TQ_START" ] || [ "$P_END" -le "$NOW" ] || [ "$P_START" -eq 0 ]; then
+    if [ "$ENFORCED" = "block" ]; then systemctl start xray 2>/dev/null || true; fi
+    if [ "$ENFORCED" = "throttle" ]; then tc_clear; fi
+    IN=0; OUT=0; ENFORCED=""
+    read -r P_START P_END <<< "$(period_bounds "$NOW" "$TQ_PERIOD" "$TQ_START")"
+    LAST_IN=$CUR_IN; LAST_OUT=$CUR_OUT; S_PORT=$TQ_PORT
+  fi
+  if [ "$S_PORT" != "$TQ_PORT" ]; then
+    LAST_IN=$CUR_IN; LAST_OUT=$CUR_OUT; S_PORT=$TQ_PORT
+  fi
+  if [ "$CUR_IN" -ge "$LAST_IN" ]; then IN=$(( IN + CUR_IN - LAST_IN )); else IN=$(( IN + CUR_IN )); fi
+  if [ "$CUR_OUT" -ge "$LAST_OUT" ]; then OUT=$(( OUT + CUR_OUT - LAST_OUT )); else OUT=$(( OUT + CUR_OUT )); fi
+  LAST_IN=$CUR_IN; LAST_OUT=$CUR_OUT
+  S_MODE=$TQ_MODE; S_PERIOD=$TQ_PERIOD; S_START=$TQ_START
+  counted_now
+  if [ "$TQ_QUOTA" -gt 0 ] && [ "$COUNTED" -ge "$TQ_QUOTA" ]; then
+    if [ "$TQ_LIMIT" = "throttle" ]; then
+      if [ "$ENFORCED" != "throttle" ] || ! tc_present; then tc_apply; fi
+      ENFORCED="throttle"
+    else
+      if systemctl is-active --quiet xray 2>/dev/null; then systemctl stop xray 2>/dev/null || true; fi
+      ENFORCED="block"
+    fi
+  else
+    if [ "$ENFORCED" = "block" ]; then systemctl start xray 2>/dev/null || true; fi
+    if [ "$ENFORCED" = "throttle" ]; then tc_clear; fi
+    ENFORCED=""
+  fi
+  save_state
+}
+mode_label() {
+  case "$1" in out) echo 出站;; in) echo 入站;; max) echo 最大值;; *) echo 总计;; esac
+}
+period_label() {
+  case "$1" in quarterly) echo 季;; yearly) echo 年;; *) echo 月;; esac
+}
+period_desc() {
+  case "$1" in
+    quarterly) printf '1/4/7/10 月 %s 日起' "$2" ;;
+    yearly) printf '每年 1 月 %s 日起' "$2" ;;
+    *) printf '每月 %s 日起' "$2" ;;
+  esac
+}
+limit_label() {
+  case "$1" in throttle) echo 限速;; *) echo 阻断;; esac
+}
+show_status() {
+  load_conf
+  NOW=$(date +%s)
+  load_state
+  local din dout dcounted dstart dend rem
+  if [ "$P_END" -le "$NOW" ] || [ "$P_START" -eq 0 ] || [ "$S_MODE|$S_PERIOD|$S_START" != "$TQ_MODE|$TQ_PERIOD|$TQ_START" ]; then
+    din=0; dout=0; dcounted=0
+    read -r dstart dend <<< "$(period_bounds "$NOW" "$TQ_PERIOD" "$TQ_START")"
+  else
+    din=$IN; dout=$OUT
+    case "$TQ_MODE" in
+      out) dcounted=$OUT ;;
+      in) dcounted=$IN ;;
+      max) [ "$IN" -gt "$OUT" ] && dcounted=$IN || dcounted=$OUT ;;
+      *) dcounted=$(( IN + OUT )) ;;
+    esac
+    dstart=$P_START; dend=$P_END
+  fi
+  echo "统计：$(mode_label "$TQ_MODE")"
+  echo "周期：$(period_label "$TQ_PERIOD")（$(period_desc "$TQ_PERIOD" "$TQ_START")）"
+  echo "本周期：$(date -d "@$dstart" +%Y-%m-%d) 至 $(date -d "@$dend" +%Y-%m-%d)"
+  echo "已用：$(fmt_bytes "$dcounted")（入站 $(fmt_bytes "$din") / 出站 $(fmt_bytes "$dout")）"
+  if [ "$TQ_QUOTA" -gt 0 ]; then
+    echo "限额：$(fmt_bytes "$TQ_QUOTA")"
+    rem=$(( TQ_QUOTA - dcounted ))
+    [ "$rem" -lt 0 ] && rem=0
+    echo "剩余：$(fmt_bytes "$rem")"
+  else
+    echo "限额：不限"
+    echo "剩余：不限"
+  fi
+  if [ "$TQ_LIMIT" = "throttle" ]; then
+    echo "限制：限速（超限后降到 $(fmt_bytes "$TQ_RATE")/s）"
+  else
+    echo "限制：阻断"
+  fi
+  if [ "$TQ_QUOTA" -gt 0 ] && [ "$dcounted" -ge "$TQ_QUOTA" ]; then
+    if [ "$TQ_LIMIT" = "throttle" ]; then
+      echo "状态：已超限（限速 $(fmt_bytes "$TQ_RATE")/s）"
+    else
+      echo "状态：已超限（阻断）"
+    fi
+  else
+    echo "状态：正常"
+  fi
+}
+if [ "$0" = "${BASH_SOURCE[0]}" ]; then
+  case "${1:-run}" in
+    run) run_watch ;;
+    status) show_status ;;
+    clear) tc_clear ;;
+    *) run_watch ;;
+  esac
+fi
+WATCHEOF
+  chmod 700 "$TQ_WATCH"
+  cat > /etc/systemd/system/traffic-watch.service <<'SVCEOF'
+[Unit]
+Description=traffic
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/traffic-watch
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+  cat > /etc/systemd/system/traffic-watch.timer <<'TMREOF'
+[Unit]
+Description=traffic
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+Persistent=true
+[Install]
+WantedBy=timers.target
+TMREOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now traffic-watch.timer 2>/dev/null || true
+}
+
 if [ "$(id -u)" -ne 0 ]; then
   die "需要 root"
 fi
 if [ "$#" -gt 0 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
   echo "用法：sudo ./install.sh"
-  echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP"
+  echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP TQ_MODE TQ_PERIOD TQ_START TQ_LIMIT TQ_QUOTA TQ_RATE"
   exit 0
 fi
+if [ "$#" -gt 0 ] && [ "$1" = "--show-traffic" ]; then traffic_status; exit 0; fi
 
 if [ -f /etc/os-release ]; then
   . /etc/os-release
@@ -442,6 +943,7 @@ if [ -f /usr/local/etc/xray/config.json ] && command -v xray >/dev/null 2>&1; th
   case "$ACTION" in
     modify) modify_node; exit 0 ;;
     show) show_info; exit 0 ;;
+    traffic) traffic_status; exit 0 ;;
     install) info "重新安装" ;;
     *) die "ACTION 无效：$ACTION" ;;
   esac
@@ -519,6 +1021,29 @@ else
   case "$SPLIT" in 1|[Yy]*) SPLIT=1 ;; *) SPLIT=0 ;; esac
 fi
 
+TQ_MODE="${TQ_MODE:-}"
+TQ_PERIOD="${TQ_PERIOD:-}"
+TQ_START="${TQ_START:-}"
+TQ_LIMIT="${TQ_LIMIT:-}"
+TQ_QUOTA="${TQ_QUOTA:-}"
+TQ_RATE="${TQ_RATE:-}"
+if [ -z "$TQ_QUOTA" ]; then
+  TQ_QUOTA_ANS="$(ask "限额 [0=不限，如 500G，默认 0]: " "0")"
+  TQ_QUOTA="$TQ_QUOTA_ANS"
+fi
+TQ_QUOTA="$(parse_bytes "$TQ_QUOTA")" || die "限额无效：$TQ_QUOTA"
+if [ "$TQ_QUOTA" -gt 0 ] && [ -z "$TQ_LIMIT" ]; then
+  TQ_LIMIT_ANS="$(ask "限制 [1 阻断 / 2 限速，默认 1]: " "1")"
+  case "$TQ_LIMIT_ANS" in 2|throttle|限速) TQ_LIMIT=throttle ;; *) TQ_LIMIT=block ;; esac
+fi
+TQ_MODE="$(norm_tq_mode "${TQ_MODE:-total}")" || die "统计模式无效：$TQ_MODE"
+TQ_PERIOD="$(norm_tq_period "${TQ_PERIOD:-monthly}")" || die "统计周期无效：$TQ_PERIOD"
+[ -z "$TQ_START" ] && TQ_START=1
+[[ "$TQ_START" =~ ^[0-9]+$ ]] && [ "$TQ_START" -ge 1 ] && [ "$TQ_START" -le 28 ] || die "起始日无效：$TQ_START，应为 1-28"
+TQ_LIMIT="$(norm_tq_limit "${TQ_LIMIT:-block}")" || die "限制模式无效：$TQ_LIMIT"
+TQ_RATE="$(parse_bytes "${TQ_RATE:-125K}")" || die "限速值无效：$TQ_RATE"
+if [ "$TQ_LIMIT" = "throttle" ] && [ "$TQ_RATE" -le 0 ]; then die "限速模式下限速值必须大于 0"; fi
+
 if [ "$MODE" = "reality" ]; then MODE_NUM=1; else MODE_NUM=2; fi
 echo ""
 echo "模式：$MODE_NUM"
@@ -527,6 +1052,7 @@ echo "端口：$PORT"
 echo "路径：$XHTTP_PATH"
 echo "UUID：$UUID"
 if [ "$SPLIT" = "1" ]; then echo "分流：开"; else echo "分流：关"; fi
+if [ "$TQ_QUOTA" = "0" ]; then echo "限额：不限"; else echo "限额：$(fmt_bytes "$TQ_QUOTA") / 限制：$(tq_limit_label "$TQ_LIMIT")"; fi
 echo "BBR：$([ "$ENABLE_BBR" = "1" ] && echo 开启 || echo 不开启)"
 echo ""
 
@@ -538,7 +1064,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl wget socat unzip jq ca-certificates gnupg openssl iproute2
+apt-get install -y curl wget socat unzip jq ca-certificates gnupg openssl iproute2 iptables
 
 if ! command -v xray >/dev/null 2>&1; then
   info "安装中..."
@@ -710,7 +1236,13 @@ else
   OUT_B_ADDR="$DOMAIN"
 fi
 OUT_ADDR="$OUT_B_ADDR"
+OUT_TQ_MODE="$TQ_MODE"; OUT_TQ_PERIOD="$TQ_PERIOD"; OUT_TQ_START="$TQ_START"
+OUT_TQ_LIMIT="$TQ_LIMIT"; OUT_TQ_QUOTA="$TQ_QUOTA"; OUT_TQ_RATE="$TQ_RATE"
+TQ_PORT="$PORT"
+write_tq_conf
+install_traffic_watch
 write_outputs
+"$TQ_WATCH" run 2>/dev/null || true
 
 echo ""
 cat "$INFO_FILE"
