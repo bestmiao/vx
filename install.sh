@@ -33,8 +33,8 @@ parse_bytes() {
     *G|*g) mult=1073741824; s="${s%?}" ;;
     *T|*t) mult=1099511627776; s="${s%?}" ;;
   esac
-  [[ "$s" =~ ^[0-9]+$ ]] || return 1
-  echo $(( s * mult ))
+  [[ "$s" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  awk -v n="$s" -v m="$mult" 'BEGIN { printf "%.0f", n * m }'
 }
 
 parse_quota() {
@@ -225,6 +225,17 @@ ask_region() {
 check_port_free() {
   local port="$1" what="$2" listeners=""
   if ! command -v ss >/dev/null 2>&1; then
+    # ss 不在就查 /proc/net/tcp*，别静默跳过
+    local hexport f _checked=0
+    hexport="$(printf '%04X' "$port")"
+    for f in /proc/net/tcp /proc/net/tcp6; do
+      [ -r "$f" ] || continue
+      _checked=1
+      if awk -v p=":$hexport" 'substr($2, length($2)-4) == p && $4 == "0A" {found=1} END {exit !found}' "$f"; then
+        die "端口 $port 已被占用"
+      fi
+    done
+    [ "$_checked" = 1 ] || warn "未找到 ss 且无法读取 /proc/net/tcp，端口 $port 冲突检查已跳过"
     return 0
   fi
   listeners="$(ss -ltnpH "sport = :$port" 2>/dev/null || true)"
@@ -380,6 +391,11 @@ refresh_outputs() {
     r_priv="$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$config_file")"
     r_sid="$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$config_file")"
     r_pub="$(grep -iE '^(PublicKey|公钥)' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
+    if [ -z "$r_pub" ] && [ -n "$r_priv" ]; then
+      # 信息文件丢了就从私钥派生公钥，别让链接里 pbk 为空
+      r_pub="$(xray x25519 -i "$r_priv" 2>/dev/null | grep -i public | awk '{print $NF}' || true)"
+    fi
+    [ -n "$r_pub" ] || die "无法获取 Reality 公钥"
     r_addr="$(grep '^落地地址：' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
     [ -z "$r_addr" ] && r_addr="$(grep -i '^地址' "$info_file" 2>/dev/null | awk -F'：' '{print $NF}' || true)"
     if [ -z "$r_addr" ]; then
@@ -470,13 +486,24 @@ delete_node() {
   systemctl stop xray 2>/dev/null || true
   systemctl disable xray 2>/dev/null || true
   systemctl disable --now traffic-watch.timer 2>/dev/null || true
+  # TLS 证书文件也清掉（Reality 模式没有这些文件）；域名先取出来，信息文件后面就删了
+  local _domain=""
+  if [ -f /usr/local/etc/xray/privkey.pem ] || [ -f /usr/local/etc/xray/fullchain.pem ]; then
+    _domain="$(grep '^SNI：' "$INFO_FILE" 2>/dev/null | awk -F'：' '{print $NF}' | tr -d ' \r\n' || true)"
+  fi
   local deleted="" f
   for f in "$config_file" "$TQ_CONF" "$TQ_STATE" "$TQ_WATCH" \
     /etc/systemd/system/traffic-watch.service /etc/systemd/system/traffic-watch.timer \
-    "$INFO_FILE" "$SPLIT_A_FILE" "$SPLIT_B_FILE"; do
+    "$INFO_FILE" "$SPLIT_A_FILE" "$SPLIT_B_FILE" \
+    /usr/local/etc/xray/privkey.pem /usr/local/etc/xray/fullchain.pem; do
     if [ -e "$f" ]; then rm -f "$f"; deleted="$deleted
 $f"; fi
   done
+  if [ -n "$_domain" ] && [ -d "$HOME/.acme.sh/${_domain}_ecc" ]; then
+    rm -rf "$HOME/.acme.sh/${_domain}_ecc"
+    deleted="$deleted
+$HOME/.acme.sh/${_domain}_ecc"
+  fi
   for f in "$config_file".bak.*; do
     [ -e "$f" ] && rm -f "$f" && deleted="$deleted
 $f"
@@ -1242,7 +1269,16 @@ EOF
 }
 
 do_add() {
-MODE="${MODE:-reality}"
+  # 已有节点时先确认，别静默覆盖（非交互不问，保持原样）
+  if [ -f /usr/local/etc/xray/config.json ] && [ "$INTERACTIVE" = 1 ]; then
+    local _ow
+    _ow="$(ask "已有节点，添加会覆盖现有节点，继续？[y/N]: " "N")"
+    case "$_ow" in
+      [Yy]|[Yy][Ee][Ss]) ;;
+      *) echo "已取消"; return 0 ;;
+    esac
+  fi
+  MODE="${MODE:-reality}"
 DOMAIN="${DOMAIN:-}"
 REGION="${REGION:-}"
 REGION_SNI=""
@@ -1306,8 +1342,10 @@ TQ_PERIOD="$(norm_tq_period "${TQ_PERIOD:-monthly}")" || die "统计周期无效
 TQ_START="${TQ_START:-1}"
 [[ "$TQ_START" =~ ^[0-9]+$ ]] && [ "$TQ_START" -ge 1 ] && [ "$TQ_START" -le 28 ] || die "起始日无效：$TQ_START，应为 1-28"
 TQ_LIMIT="$(norm_tq_limit "${TQ_LIMIT:-block}")" || die "限制模式无效：$TQ_LIMIT"
-TQ_QUOTA="$(parse_quota "${TQ_QUOTA:-0}")" || die "限额无效：$TQ_QUOTA"
-TQ_RATE="$(parse_bytes "${TQ_RATE:-125K}")" || die "限速值无效：$TQ_RATE"
+_raw_quota="${TQ_QUOTA:-0}"
+TQ_QUOTA="$(parse_quota "$_raw_quota")" || die "限额无效：$_raw_quota"
+_raw_rate="${TQ_RATE:-125K}"
+TQ_RATE="$(parse_bytes "$_raw_rate")" || die "限速值无效：$_raw_rate"
 if [ "$TQ_LIMIT" = "throttle" ] && [ "$TQ_RATE" -le 0 ]; then die "限速模式下限速值必须大于 0"; fi
 TQ_IFACE="${TQ_IFACE:-}"
 
@@ -1398,7 +1436,7 @@ else
   "$HOME/.acme.sh/acme.sh" --install-cert -d "$DOMAIN" --ecc \
     --key-file /usr/local/etc/xray/privkey.pem \
     --fullchain-file /usr/local/etc/xray/fullchain.pem \
-    --reloadcmd "systemctl restart xray" || true
+    --reloadcmd "systemctl restart xray" || die "证书安装失败"
   CERT_FILE="/usr/local/etc/xray/fullchain.pem"
   KEY_FILE="/usr/local/etc/xray/privkey.pem"
 fi
@@ -1581,6 +1619,8 @@ while :; do
       elif load_preset; then
         info "添加节点"
         do_add
+      elif [ "$INTERACTIVE" = 0 ]; then
+        die "没有节点且未指定套餐（请用 TQ_PRESET=gcp 或 TQ_PRESET=cdt）"
       fi
       ;;
     traffic) traffic_status ;;
