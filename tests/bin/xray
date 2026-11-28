@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+echo "xray $*" >> "$TQ_TEST_ROOT/log"
+if [ "$1" = "run" ]; then
+  cfg=""
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "-config" ]; then cfg="$a"; break; fi
+    prev="$a"
+  done
+  if [ -n "$cfg" ]; then
+    jq -e . "$cfg" >/dev/null 2>&1
+    exit $?
+  fi
+  exit 0
+fi
+case "$1" in
+  version) echo "Xray 1.0-stub (go1.23.4 linux/amd64)" ;;
+  x25519)
+    p=$(printf 'A%.0s' $(seq 1 43))
+    q=$(printf 'B%.0s' $(seq 1 43))
+    echo "Private key: ${p}="
+    echo "Public key: ${q}="
+    ;;
+  tls) exit 0 ;;
+  *) exit 0 ;;
+esac

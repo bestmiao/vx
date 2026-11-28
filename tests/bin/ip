@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+echo "ip $*" >> "$TQ_TEST_ROOT/log"
+case "$*" in
+  *"-o route get"*) echo "1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.2 uid 0" ;;
+  *"route show default"*) echo "default via 10.0.0.1 dev eth0 proto static" ;;
+  *) ;;
+esac
+exit 0

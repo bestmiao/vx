@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+echo "iptables $*" >> "$TQ_TEST_ROOT/log"
+RULES="$TQ_TEST_ROOT/ipt.rules"
+touch "$RULES"
+case "$1" in
+  -A)
+    shift
+    printf '%s\n' "$*" >> "$RULES"
+    ;;
+  -D)
+    shift
+    grep -vF -- "$*" "$RULES" > "$RULES.tmp" 2>/dev/null || true
+    mv "$RULES.tmp" "$RULES"
+    ;;
+  *)
+    ;;
+esac
+exit 0

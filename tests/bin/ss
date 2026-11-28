@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "ss $*" >> "$TQ_TEST_ROOT/log"
+exit 0

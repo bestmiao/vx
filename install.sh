@@ -113,10 +113,16 @@ tq_preset_label() {
 apply_whitelist() {
   local cfg="$1" on="$2"
   if [ "$on" = "1" ]; then
-    jq '.inbounds[0].sniffing = {enabled: true, destOverride: ["http", "tls", "quic"]}
+    # 白名单对所有协议的入站都生效：VLESS 打 vless、ss2022 打 ss2022，
+    # 两个 tag 都写进路由规则的 inboundTag；域名嗅探每个入站都要开，
+    # 不然 geosite:google 匹配不到目标域名。VLESS 单独时和原来一样。
+    jq '.inbounds |= map(
+          if .protocol == "vless" then .tag = "vless" | .sniffing = {enabled: true, destOverride: ["http", "tls", "quic"]}
+          elif .protocol == "shadowsocks" then .tag = "ss2022" | .sniffing = {enabled: true, destOverride: ["http", "tls", "quic"]}
+          else . end)
       | .routing = {rules: [
-          {type: "field", domain: ["geosite:google"], outboundTag: "direct"},
-          {type: "field", outboundTag: "blocked"}
+          {type: "field", inboundTag: ([.inbounds[].tag // empty] | unique), domain: ["geosite:google"], outboundTag: "direct"},
+          {type: "field", inboundTag: ([.inbounds[].tag // empty] | unique), outboundTag: "blocked"}
         ]}
       | if ([.outbounds[]?.tag] | index("direct")) == null then .outbounds += [{protocol: "freedom", tag: "direct"}] else . end
       | if ([.outbounds[]?.tag] | index("blocked")) == null then .outbounds += [{protocol: "blackhole", tag: "blocked"}] else . end' \
@@ -222,6 +228,34 @@ ask_region() {
   REGION_LABEL="$(region_label "$REGION")"
 }
 
+norm_protocol() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    vless|1|"") echo vless ;;
+    ss2022|ss|2) echo ss2022 ;;
+    *) return 1 ;;
+  esac
+}
+
+ask_protocol() {
+  local p="${PROTOCOL:-}"
+  if [ -n "$p" ]; then
+    PROTOCOL="$(norm_protocol "$p")" || die "协议无效：$p"
+    return 0
+  fi
+  # Interactive menu only: prompt. Non-interactive (ACTION set via env) defaults
+  # to VLESS without reading stdin, so scripted runs never block on this prompt.
+  if [ "${INTERACTIVE:-0}" = 1 ]; then
+    echo "协议："
+    echo "  1) VLESS"
+    echo "  2) ss2022"
+    local ans
+    ans="$(ask "请选择 [1-2，默认 1]: " "1")"
+    PROTOCOL="$(norm_protocol "$ans")" || die "协议无效：$ans"
+    return 0
+  fi
+  PROTOCOL="vless"
+}
+
 check_port_free() {
   local port="$1" what="$2" listeners=""
   if ! command -v ss >/dev/null 2>&1; then
@@ -244,11 +278,39 @@ check_port_free() {
   fi
 }
 
+gen_ss_password() {
+  local pw
+  pw="$(openssl rand -base64 32 | tr -d '\n')"
+  is_b64key "$pw" || die "生成 ss2022 密码失败"
+  printf '%s' "$pw"
+}
+
+build_ss_link() {
+  local method="$1" password="$2" addr="$3" port="$4" tag="${5:-ss2022}"
+  local userinfo
+  userinfo="$(printf '%s:%s' "$method" "$password" | base64 -w0 | tr '+/' '-_' | tr -d '=' | tr -d '\n')"
+  printf 'ss://%s@%s:%s#%s' "$userinfo" "$addr" "$port" "$tag"
+}
+
+check_port_not_in_config() {
+  local port="$1" config_file="/usr/local/etc/xray/config.json"
+  [ -f "$config_file" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  if jq -e --argjson port "$port" '[.inbounds[] | select(.protocol != "shadowsocks") | .port] | index($port) != null' "$config_file" >/dev/null 2>&1; then
+    die "端口 $port 已被现有节点占用"
+  fi
+}
+
 edit_node() {
   local config_file="/usr/local/etc/xray/config.json"
   local info_file="$INFO_FILE"
   [ -f "$config_file" ] || die "没有找到配置 $config_file"
   command -v jq >/dev/null 2>&1 || die "需要 jq"
+  if ! jq -e '[.inbounds[].protocol] | index("vless") != null' "$config_file" >/dev/null 2>&1; then
+    echo "当前只有 ss2022 节点，编辑节点暂只支持 VLESS 节点。"
+    echo "ss2022 节点请先删除节点再重新添加。"
+    return 0
+  fi
 
   local cur_port cur_mode cur_sni
   cur_port="$(jq -r '.inbounds[0].port' "$config_file")"
@@ -373,6 +435,7 @@ edit_node() {
   sleep 2
 
   refresh_outputs "$cur_mode" "$new_port" "$new_sni" "${REGION_LABEL:-}"
+  refresh_ss_info_if_present
   echo ""
   cat "$info_file"
 }
@@ -437,37 +500,79 @@ refresh_outputs() {
   write_outputs
 }
 
+refresh_ss_info_if_present() {
+  local config_file="/usr/local/etc/xray/config.json"
+  [ -f "$config_file" ] || return 0
+  [ -f "$SS_INFO_FILE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local ss_port ss_password ss_addr ss_link
+  ss_port="$(jq -r '.inbounds[] | select(.protocol == "shadowsocks") | .port // empty' "$config_file" 2>/dev/null || true)"
+  [ -n "$ss_port" ] || return 0
+  ss_password="$(jq -r '.inbounds[] | select(.protocol == "shadowsocks") | .settings.password // empty' "$config_file" 2>/dev/null || true)"
+  [ -n "$ss_password" ] || return 0
+  ss_addr="$(grep '^地址：' "$SS_INFO_FILE" 2>/dev/null | awk -F'：' '{print $NF}' | tr -d ' \r\n' || true)"
+  [ -z "$ss_addr" ] && ss_addr="${PUBLIC_IP:-}"
+  if [ -z "$ss_addr" ]; then
+    ss_addr="$(curl -4s --max-time 8 https://api.ipify.org || echo "")"
+    ss_addr="$(printf '%s' "$ss_addr" | tr -d ' \r\n')"
+  fi
+  [ -n "$ss_addr" ] || return 0
+  ss_link="$(build_ss_link "2022-blake3-aes-256-gcm" "$ss_password" "$ss_addr" "$ss_port")"
+  write_ss_outputs "$ss_addr" "$ss_port" "$ss_password" "$ss_link"
+}
+
 list_nodes() {
   local config_file="/usr/local/etc/xray/config.json"
-  local info_file="$INFO_FILE"
   local shown=0 line
   echo "节点："
-  echo "  节点 1："
-  if [ -f "$info_file" ]; then
+  if [ -f "$INFO_FILE" ]; then
+    echo "  节点 1："
     while IFS= read -r line; do
       case "$line" in
         地址：*|端口：*|地区：*|模式：*|SNI：*|套餐：*|限额：*|限制：*|限速：*)
           echo "    $line"; shown=1 ;;
       esac
-    done < "$info_file"
+    done < "$INFO_FILE"
+  fi
+  if [ -f "$SS_INFO_FILE" ]; then
+    echo "  节点 2："
+    while IFS= read -r line; do
+      case "$line" in
+        协议：*|地址：*|端口：*|加密方式：*|套餐：*|限额：*|限制：*|限速：*)
+          echo "    $line"; shown=1 ;;
+      esac
+    done < "$SS_INFO_FILE"
   fi
   if [ "$shown" = "0" ]; then
-    local port mode sni preset quota
-    port="$(jq -r '.inbounds[0].port // empty' "$config_file" 2>/dev/null || true)"
-    mode="Reality"
-    if jq -e '.inbounds[0].streamSettings.security == "tls"' "$config_file" >/dev/null 2>&1; then mode="TLS"; fi
-    if [ "$mode" = "Reality" ]; then
-      sni="$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$config_file" 2>/dev/null || true)"
-    else
-      sni=""
-    fi
-    preset="$(grep -E '^TQ_PRESET=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"
-    quota="$(grep -E '^TQ_QUOTA=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"
-    [ -n "$port" ] && echo "    端口：$port"
-    echo "    模式：$mode"
-    [ -n "$sni" ] && echo "    SNI：$sni"
-    echo "    套餐：$(tq_preset_label "${preset:-custom}")"
-    if [ "${quota:-0}" = "0" ]; then echo "    限额：不限"; else echo "    限额：$(fmt_bytes "$quota")"; fi
+    local count i proto port mode sni preset quota
+    count="$(jq -r '.inbounds | length' "$config_file" 2>/dev/null || echo 0)"
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      proto="$(jq -r ".inbounds[$i].protocol // empty" "$config_file" 2>/dev/null || true)"
+      port="$(jq -r ".inbounds[$i].port // empty" "$config_file" 2>/dev/null || true)"
+      echo "  节点 $((i+1))："
+      if [ "$proto" = "shadowsocks" ]; then
+        echo "    协议：ss2022"
+        [ -n "$port" ] && echo "    端口：$port"
+        echo "    加密方式：2022-blake3-aes-256-gcm"
+      else
+        mode="Reality"
+        if jq -e ".inbounds[$i].streamSettings.security == \"tls\"" "$config_file" >/dev/null 2>&1; then mode="TLS"; fi
+        if [ "$mode" = "Reality" ]; then
+          sni="$(jq -r ".inbounds[$i].streamSettings.realitySettings.serverNames[0] // empty" "$config_file" 2>/dev/null || true)"
+        else
+          sni=""
+        fi
+        preset="$(grep -E '^TQ_PRESET=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"
+        quota="$(grep -E '^TQ_QUOTA=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"
+        [ -n "$port" ] && echo "    端口：$port"
+        echo "    模式：$mode"
+        [ -n "$sni" ] && echo "    SNI：$sni"
+        echo "    套餐：$(tq_preset_label "${preset:-custom}")"
+        if [ "${quota:-0}" = "0" ]; then echo "    限额：不限"; else echo "    限额：$(fmt_bytes "$quota")"; fi
+      fi
+      i=$((i+1))
+    done
   fi
 }
 
@@ -494,7 +599,7 @@ delete_node() {
   local deleted="" f
   for f in "$config_file" "$TQ_CONF" "$TQ_STATE" "$TQ_WATCH" \
     /etc/systemd/system/traffic-watch.service /etc/systemd/system/traffic-watch.timer \
-    "$INFO_FILE" "$SPLIT_A_FILE" "$SPLIT_B_FILE" \
+    "$INFO_FILE" "$SS_INFO_FILE" "$SPLIT_A_FILE" "$SPLIT_B_FILE" \
     /usr/local/etc/xray/privkey.pem /usr/local/etc/xray/fullchain.pem; do
     if [ -e "$f" ]; then rm -f "$f"; deleted="$deleted
 $f"; fi
@@ -542,6 +647,84 @@ preset_create() {
   return 0
 }
 
+load_preset_ss2022() {
+  local config_file="/usr/local/etc/xray/config.json"
+  local env_tq_iface="${TQ_IFACE:-}"
+  local env_tq_preset="${TQ_PRESET:-}"
+  local cur_tq_mode cur_tq_period cur_tq_start cur_tq_limit cur_tq_quota cur_tq_rate cur_tq_preset
+  cur_tq_mode=total; cur_tq_period=monthly; cur_tq_start=1; cur_tq_limit=block; cur_tq_quota=0; cur_tq_rate=128000
+  cur_tq_preset=custom
+  if [ -f "$TQ_CONF" ]; then
+    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""; TQ_IFACE=""; TQ_PRESET=""
+    . "$TQ_CONF"
+    cur_tq_mode="${TQ_MODE:-total}"; cur_tq_period="${TQ_PERIOD:-monthly}"; cur_tq_start="${TQ_START:-1}"
+    cur_tq_limit="${TQ_LIMIT:-block}"; cur_tq_quota="${TQ_QUOTA:-0}"; cur_tq_rate="${TQ_RATE:-128000}"
+    cur_tq_preset="${TQ_PRESET:-custom}"
+    case "$cur_tq_preset" in gcp|cdt|custom) ;; *) cur_tq_preset=custom ;; esac
+  fi
+  TQ_IFACE="${env_tq_iface:-${TQ_IFACE:-}}"
+  local new_tq_preset preset_ans
+  new_tq_preset="${env_tq_preset:-}"
+  if [ -n "$new_tq_preset" ]; then
+    new_tq_preset="$(norm_tq_preset "$new_tq_preset")" || die "套餐无效：$new_tq_preset"
+  else
+    echo "当前套餐：$(tq_preset_label "$cur_tq_preset")"
+    echo "  1) GCP：180G / 总计 / 月 / 1日 / 阻断"
+    echo "  2) 阿里云CDT：180G / 最大值 / 月 / 1日 / 阻断"
+    preset_ans="$(ask "请选择 [1/2，0 返回]: " "0")"
+    case "$preset_ans" in
+      0|"") return 0 ;;
+      1) new_tq_preset=gcp ;;
+      2) new_tq_preset=cdt ;;
+      gcp|cdt) new_tq_preset="$preset_ans" ;;
+      *) die "套餐无效：$preset_ans" ;;
+    esac
+  fi
+  local new_tq_mode new_tq_period new_tq_start new_tq_limit new_tq_quota new_tq_rate
+  new_tq_rate="$cur_tq_rate"
+  if [ "$new_tq_preset" = "gcp" ]; then
+    new_tq_mode=total; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320; new_tq_rate=0
+  elif [ "$new_tq_preset" = "cdt" ]; then
+    new_tq_mode=max; new_tq_period=monthly; new_tq_start=1; new_tq_limit=block; new_tq_quota=193273528320; new_tq_rate=0
+  else
+    new_tq_mode="$cur_tq_mode"; new_tq_period="$cur_tq_period"; new_tq_start="$cur_tq_start"
+    new_tq_limit="$cur_tq_limit"; new_tq_quota="$cur_tq_quota"
+  fi
+  local old_tq_sig new_tq_sig
+  old_tq_sig="$cur_tq_mode|$cur_tq_period|$cur_tq_start"
+  new_tq_sig="$new_tq_mode|$new_tq_period|$new_tq_start"
+  TQ_MODE="$new_tq_mode"; TQ_PERIOD="$new_tq_period"; TQ_START="$new_tq_start"
+  TQ_LIMIT="$new_tq_limit"; TQ_QUOTA="$new_tq_quota"; TQ_RATE="$new_tq_rate"
+  TQ_PORT="$(jq -r '.inbounds[] | select(.protocol == "shadowsocks") | .port' "$config_file")"
+  TQ_SS_PORT="$TQ_PORT"
+  TQ_PRESET="$new_tq_preset"
+  write_tq_conf
+  if [ "$old_tq_sig" != "$new_tq_sig" ]; then
+    if [ -f "$TQ_STATE" ]; then
+      local tq_enf
+      tq_enf="$(jq -r '.enforced // ""' "$TQ_STATE" 2>/dev/null || echo "")"
+      [ "$tq_enf" = "block" ] && systemctl start xray 2>/dev/null || true
+      if [ "$tq_enf" = "throttle" ]; then [ -x "$TQ_WATCH" ] && "$TQ_WATCH" clear 2>/dev/null || true; fi
+      rm -f "$TQ_STATE"
+    fi
+  fi
+  # 白名单跟预设走（和 VLESS 的 load_preset 一样）：GCP 就给 ss2022 也设上，
+  # CDT/自定义就清掉；改了路由要校验 + 重启 xray 才生效。
+  if [ "$new_tq_preset" = "gcp" ]; then
+    ensure_geosite
+    apply_whitelist "$config_file" 1
+  else
+    apply_whitelist "$config_file" 0
+  fi
+  xray run -test -config "$config_file" || die "配置校验失败"
+  systemctl restart xray
+  sleep 2
+  refresh_ss_info_if_present
+  [ -x "$TQ_WATCH" ] && "$TQ_WATCH" run 2>/dev/null || true
+  echo ""
+  cat "$SS_INFO_FILE"
+}
+
 load_preset() {
   local config_file="/usr/local/etc/xray/config.json"
   local info_file="$INFO_FILE"
@@ -550,6 +733,10 @@ load_preset() {
     return $?
   fi
   command -v jq >/dev/null 2>&1 || die "需要 jq"
+  if ! jq -e '[.inbounds[].protocol] | index("vless") != null' "$config_file" >/dev/null 2>&1; then
+    load_preset_ss2022
+    return $?
+  fi
 
   local cur_mode cur_sni
   cur_mode="reality"
@@ -664,23 +851,35 @@ load_preset() {
   sleep 2
 
   refresh_outputs "$cur_mode" "$TQ_PORT" "$new_sni" "$new_region_label"
+  refresh_ss_info_if_present
   [ -x "$TQ_WATCH" ] && "$TQ_WATCH" run 2>/dev/null || true
   echo ""
   cat "$info_file"
 }
 
 show_info() {
+  local shown=0
   if [ -f "$INFO_FILE" ]; then
     cat "$INFO_FILE"
-  else
-    die "没有找到信息文件"
+    shown=1
   fi
+  if [ -f "$SS_INFO_FILE" ]; then
+    [ "$shown" = "1" ] && echo ""
+    cat "$SS_INFO_FILE"
+    shown=1
+  fi
+  [ "$shown" = "1" ] || die "没有找到信息文件"
   echo ""
   traffic_status
 }
 
 write_tq_conf() {
   mkdir -p "$(dirname "$TQ_CONF")"
+  local _ss_port="${TQ_SS_PORT:-}"
+  if [ -z "$_ss_port" ] && [ -f "$TQ_CONF" ]; then
+    _ss_port="$(grep '^TQ_SS_PORT=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"
+  fi
+  _ss_port="${_ss_port:-0}"
   {
     echo "TQ_MODE=$TQ_MODE"
     echo "TQ_PERIOD=$TQ_PERIOD"
@@ -689,6 +888,7 @@ write_tq_conf() {
     echo "TQ_QUOTA=$TQ_QUOTA"
     echo "TQ_RATE=$TQ_RATE"
     echo "TQ_PORT=$TQ_PORT"
+    echo "TQ_SS_PORT=$_ss_port"
     echo "TQ_IFACE=${TQ_IFACE:-}"
     echo "TQ_PRESET=${TQ_PRESET:-custom}"
   } > "$TQ_CONF.tmp"
@@ -705,11 +905,45 @@ traffic_status() {
 }
 
 INFO_FILE="/root/install-info.txt"
+SS_INFO_FILE="/root/ss2022-info.txt"
 SPLIT_A_FILE="/root/split-a.json"
 SPLIT_B_FILE="/root/split-b.json"
 TQ_CONF="/usr/local/etc/xray/traffic.conf"
 TQ_STATE="/usr/local/etc/xray/traffic.json"
 TQ_WATCH="/usr/local/bin/traffic-watch"
+
+write_ss_outputs() {
+  local ss_addr="$1" ss_port="$2" ss_password="$3" ss_link="$4"
+  local c_mode c_period c_start c_limit c_quota c_rate c_preset
+  c_mode=total; c_period=monthly; c_start=1; c_limit=block; c_quota=0; c_rate=128000; c_preset=custom
+  if [ -f "$TQ_CONF" ]; then
+    TQ_MODE=""; TQ_PERIOD=""; TQ_START=""; TQ_LIMIT=""; TQ_QUOTA=""; TQ_RATE=""; TQ_IFACE=""; TQ_PRESET=""
+    . "$TQ_CONF"
+    c_mode="${TQ_MODE:-total}"; c_period="${TQ_PERIOD:-monthly}"; c_start="${TQ_START:-1}"
+    c_limit="${TQ_LIMIT:-block}"; c_quota="${TQ_QUOTA:-0}"; c_rate="${TQ_RATE:-128000}"
+    c_preset="${TQ_PRESET:-custom}"
+  fi
+  {
+    echo "协议：ss2022"
+    echo "地址：$ss_addr"
+    echo "端口：$ss_port"
+    echo "加密方式：2022-blake3-aes-256-gcm"
+    echo "密码：$ss_password"
+    echo "统计：$(tq_mode_label "$c_mode")"
+    echo "套餐：$(tq_preset_label "$c_preset")"
+    [ "$c_preset" = "gcp" ] && echo "白名单：仅谷歌系"
+    echo "范围：整机"
+    echo "周期：$(tq_period_label "$c_period")"
+    echo "起始日：$c_start"
+    echo "限制：$(tq_limit_label "$c_limit")"
+    if [ "$c_quota" = "0" ]; then echo "限额：不限"; else echo "限额：$(fmt_bytes "$c_quota")"; fi
+    if [ "$c_rate" = "0" ]; then echo "限速：不限速"; else echo "限速：$(fmt_bytes "$c_rate")/s"; fi
+    echo "流量文件：$TQ_STATE"
+    echo "链接："
+    echo "$ss_link"
+  } > "$SS_INFO_FILE"
+  chmod 600 "$SS_INFO_FILE"
+}
 
 write_outputs() {
   local mode_label encoded_path base_link
@@ -875,6 +1109,10 @@ install_traffic_watch() {
     iptables -D INPUT -p tcp --dport "$TQ_PORT" 2>/dev/null || true
     iptables -D OUTPUT -p tcp --sport "$TQ_PORT" 2>/dev/null || true
   fi
+  if command -v iptables >/dev/null 2>&1 && [ -n "${TQ_SS_PORT:-}" ] && [ "$TQ_SS_PORT" != "0" ]; then
+    iptables -D INPUT -p tcp --dport "$TQ_SS_PORT" 2>/dev/null || true
+    iptables -D OUTPUT -p tcp --sport "$TQ_SS_PORT" 2>/dev/null || true
+  fi
   cat > "$TQ_WATCH" <<'WATCHEOF'
 #!/usr/bin/env bash
 TQ_CONF="${TQ_CONF:-/usr/local/etc/xray/traffic.conf}"
@@ -963,7 +1201,7 @@ period_bounds() {
 }
 load_conf() {
   local env_iface="${TQ_IFACE:-}"
-  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=0; TQ_RATE=128000; TQ_PORT=443; TQ_IFACE=""; TQ_PRESET=custom
+  TQ_MODE=total; TQ_PERIOD=monthly; TQ_START=1; TQ_LIMIT=block; TQ_QUOTA=0; TQ_RATE=128000; TQ_PORT=443; TQ_SS_PORT=0; TQ_IFACE=""; TQ_PRESET=custom
   if [ -f "$TQ_CONF" ]; then
     . "$TQ_CONF"
   fi
@@ -976,6 +1214,7 @@ load_conf() {
   [[ "$TQ_QUOTA" =~ ^[0-9]+$ ]] || TQ_QUOTA=0
   [[ "$TQ_RATE" =~ ^[0-9]+$ ]] || TQ_RATE=128000
   [[ "$TQ_PORT" =~ ^[0-9]+$ ]] || TQ_PORT=443
+  [[ "$TQ_SS_PORT" =~ ^[0-9]+$ ]] || TQ_SS_PORT=0
 }
 load_state() {
   IN=0; OUT=0; LAST_IN=0; LAST_OUT=0; P_START=0; P_END=0
@@ -1020,7 +1259,7 @@ save_state() {
 cleanup_old_rules() {
   local p
   command -v iptables >/dev/null 2>&1 || return 0
-  for p in "$TQ_PORT" "$S_PORT"; do
+  for p in "$TQ_PORT" "$S_PORT" "$TQ_SS_PORT"; do
     case "$p" in ''|0) continue ;; esac
     iptables -D INPUT -p tcp --dport "$p" 2>/dev/null || true
     iptables -D OUTPUT -p tcp --sport "$p" 2>/dev/null || true
@@ -1061,6 +1300,10 @@ tc_apply() {
   tc filter replace dev "$IFACE" parent 1: protocol ip prio 1 u32 match ip sport "$TQ_PORT" 0xffff flowid 1:10 2>/dev/null || true
   tc qdisc replace dev "$IFACE" handle ffff: ingress 2>/dev/null || true
   tc filter replace dev "$IFACE" parent ffff: protocol ip prio 1 u32 match ip dport "$TQ_PORT" 0xffff police rate "${kbit}kbit" burst 64kbit drop 2>/dev/null || true
+  if [ "${TQ_SS_PORT:-0}" -gt 0 ]; then
+    tc filter replace dev "$IFACE" parent 1: protocol ip prio 1 u32 match ip sport "$TQ_SS_PORT" 0xffff flowid 1:10 2>/dev/null || true
+    tc filter replace dev "$IFACE" parent ffff: protocol ip prio 1 u32 match ip dport "$TQ_SS_PORT" 0xffff police rate "${kbit}kbit" burst 64kbit drop 2>/dev/null || true
+  fi
 }
 tc_clear() {
   command -v tc >/dev/null 2>&1 || return 0
@@ -1220,7 +1463,7 @@ fi
 if [ "$#" -gt 0 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
   echo "用法：sudo ./install.sh"
   echo "动作：add view edit delete preset"
-  echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP TQ_MODE TQ_PERIOD TQ_START TQ_LIMIT TQ_QUOTA TQ_RATE TQ_IFACE TQ_PRESET"
+  echo "环境变量：SPLIT MODE REGION REALITY_TARGET PORT XHTTP_PATH UUID ENABLE_BBR ACTION PUBLIC_IP TQ_MODE TQ_PERIOD TQ_START TQ_LIMIT TQ_QUOTA TQ_RATE TQ_IFACE TQ_PRESET PROTOCOL SS_PORT SS_PASSWORD"
   exit 0
 fi
 if [ "$#" -gt 0 ] && [ "$1" = "--show-traffic" ]; then traffic_status; exit 0; fi
@@ -1268,7 +1511,197 @@ EOF
   curl -fsSL "$VX_URL" -o "$VX_BACKUP" 2>/dev/null || warn "保存 vx 备份失败（GitHub 连不上），vx 离线时无法用备份打开菜单"
 }
 
+do_add_ss2022() {
+  local ss_port ss_password ss_addr ss_link vless_port config_file
+  local _preset_raw _raw_quota _raw_rate
+  _preset_raw="${TQ_PRESET:-custom}"
+  TQ_PRESET="$(norm_tq_preset "$_preset_raw")" || die "套餐无效：$_preset_raw"
+  TQ_MODE="$(norm_tq_mode "${TQ_MODE:-total}")" || die "统计模式无效：$TQ_MODE"
+  TQ_PERIOD="$(norm_tq_period "${TQ_PERIOD:-monthly}")" || die "统计周期无效：$TQ_PERIOD"
+  TQ_START="${TQ_START:-1}"
+  [[ "$TQ_START" =~ ^[0-9]+$ ]] && [ "$TQ_START" -ge 1 ] && [ "$TQ_START" -le 28 ] || die "起始日无效：$TQ_START，应为 1-28"
+  TQ_LIMIT="$(norm_tq_limit "${TQ_LIMIT:-block}")" || die "限制模式无效：$TQ_LIMIT"
+  _raw_quota="${TQ_QUOTA:-0}"
+  TQ_QUOTA="$(parse_quota "$_raw_quota")" || die "限额无效：$_raw_quota"
+  _raw_rate="${TQ_RATE:-125K}"
+  TQ_RATE="$(parse_bytes "$_raw_rate")" || die "限速值无效：$_raw_rate"
+  if [ "$TQ_LIMIT" = "throttle" ] && [ "$TQ_RATE" -le 0 ]; then die "限速模式下限速值必须大于 0"; fi
+  TQ_IFACE="${TQ_IFACE:-}"
+  if [ -f "$TQ_CONF" ] && [ -f /usr/local/etc/xray/config.json ]; then
+    local _v
+    _v="$(grep '^TQ_MODE=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"; [ -n "$_v" ] && TQ_MODE="$_v"
+    _v="$(grep '^TQ_PERIOD=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"; [ -n "$_v" ] && TQ_PERIOD="$_v"
+    _v="$(grep '^TQ_START=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"; [ -n "$_v" ] && TQ_START="$_v"
+    _v="$(grep '^TQ_LIMIT=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"; [ -n "$_v" ] && TQ_LIMIT="$_v"
+    _v="$(grep '^TQ_QUOTA=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"; [ -n "$_v" ] && TQ_QUOTA="$_v"
+    _v="$(grep '^TQ_RATE=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"; [ -n "$_v" ] && TQ_RATE="$_v"
+    _v="$(grep '^TQ_PRESET=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"; [ -n "$_v" ] && TQ_PRESET="$_v"
+    _v="$(grep '^TQ_IFACE=' "$TQ_CONF" 2>/dev/null | cut -d= -f2 || true)"; TQ_IFACE="$_v"
+  fi
+
+  if [ -f /usr/local/etc/xray/config.json ] && [ "$INTERACTIVE" = 1 ]; then
+    if jq -e '[.inbounds[].protocol] | index("shadowsocks") != null' /usr/local/etc/xray/config.json >/dev/null 2>&1; then
+      local _ow
+      _ow="$(ask "已有 ss2022 节点，添加会覆盖它，继续？[y/N]: " "N")"
+      case "$_ow" in
+        [Yy]|[Yy][Ee][Ss]) ;;
+        *) echo "已取消"; return 0 ;;
+      esac
+    fi
+  fi
+
+  ss_port="${SS_PORT:-${PORT:-}}"
+  while [ -z "$ss_port" ] || ! is_port "$ss_port"; do
+    [ -n "$ss_port" ] && warn "端口无效：$ss_port"
+    ss_port="$(ask "端口 [默认 8388]: " "8388")"
+  done
+  check_port_free "$ss_port" "Xray"
+  check_port_not_in_config "$ss_port"
+
+  ss_password="${SS_PASSWORD:-}"
+  if [ -z "$ss_password" ]; then
+    ss_password="$(gen_ss_password)"
+  fi
+  is_b64key "$ss_password" || die "ss2022 密码无效"
+
+  ss_addr="${PUBLIC_IP:-}"
+  if [ -z "$ss_addr" ]; then
+    ss_addr="$(curl -4s --max-time 8 https://api.ipify.org \
+      || curl -4s --max-time 8 https://ifconfig.me \
+      || curl -4s --max-time 8 https://icanhazip.com \
+      || echo "")"
+    ss_addr="$(printf '%s' "$ss_addr" | tr -d ' \r\n')"
+  fi
+  [ -n "$ss_addr" ] || die "无法获取公网 IP（可用 PUBLIC_IP 指定）"
+
+  ENABLE_BBR="${ENABLE_BBR:-1}"
+  case "$ENABLE_BBR" in
+    1|[Yy]*|[Yy][Ee][Ss]) ENABLE_BBR=1 ;;
+    *) ENABLE_BBR=0 ;;
+  esac
+
+  echo ""
+  echo "协议：ss2022"
+  echo "端口：$ss_port"
+  echo "加密方式：2022-blake3-aes-256-gcm"
+  if [ "$TQ_QUOTA" = "0" ]; then echo "限额：不限"; else echo "限额：$(fmt_bytes "$TQ_QUOTA") / 限制：$(tq_limit_label "$TQ_LIMIT")"; fi
+  echo "BBR：$([ "$ENABLE_BBR" = "1" ] && echo 开启 || echo 不开启)"
+  echo ""
+
+  if [ "$ENABLE_BBR" = "1" ]; then
+    enable_bbr
+  else
+    info "跳过。"
+  fi
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl wget socat unzip jq ca-certificates gnupg openssl iproute2 iptables
+
+  if ! command -v xray >/dev/null 2>&1; then
+    info "安装中..."
+    curl -fsSL -o "$TMPDIR_WORK/install-release.sh" \
+      https://github.com/XTLS/Xray-install/raw/main/install-release.sh
+    test -s "$TMPDIR_WORK/install-release.sh" || die "下载失败"
+    if [ -n "${XRAY_VERSION:-}" ]; then
+      bash "$TMPDIR_WORK/install-release.sh" install --version "$XRAY_VERSION"
+    else
+      bash "$TMPDIR_WORK/install-release.sh" install
+    fi
+    command -v xray >/dev/null 2>&1 || die "安装失败，未找到 xray"
+  else
+    info "已安装：$(xray version 2>/dev/null | head -n 1 || echo 未知版本)"
+  fi
+
+  config_file="/usr/local/etc/xray/config.json"
+  mkdir -p /usr/local/etc/xray
+  if [ -f "$config_file" ]; then
+    cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
+    info "旧配置已备份"
+    jq --argjson port "$ss_port" --arg password "$ss_password" \
+      '.inbounds = ((.inbounds // []) | map(select(.protocol != "shadowsocks")) + [{
+          listen: "0.0.0.0",
+          port: $port,
+          protocol: "shadowsocks",
+          settings: {method: "2022-blake3-aes-256-gcm", password: $password, network: "tcp,udp"}
+        }])' \
+      "$config_file" > "$config_file.tmp"
+  else
+    jq -n --argjson port "$ss_port" --arg password "$ss_password" \
+      '{
+        log: {loglevel: "warning"},
+        inbounds: [{
+          listen: "0.0.0.0",
+          port: $port,
+          protocol: "shadowsocks",
+          settings: {method: "2022-blake3-aes-256-gcm", password: $password, network: "tcp,udp"}
+        }],
+        outbounds: [
+          {protocol: "freedom", tag: "direct"},
+          {protocol: "blackhole", tag: "blocked"}
+        ]
+      }' > "$config_file.tmp"
+  fi
+  jq -e . "$config_file.tmp" >/dev/null || die "配置不是合法 JSON"
+  mv "$config_file.tmp" "$config_file"
+
+  if id xray >/dev/null 2>&1; then
+    chgrp xray "$config_file" 2>/dev/null || true
+    chmod 640 "$config_file" 2>/dev/null || true
+  fi
+
+  # GCP 预设的 Google 白名单对所有协议生效：ss2022 也要走 geosite:google，
+  # 非谷歌流量跟 VLESS 一样被阻断；CDT/自定义不设白名单，已有白名单要清掉。
+  if [ "$TQ_PRESET" = "gcp" ]; then
+    ensure_geosite
+    apply_whitelist "$config_file" 1
+  else
+    apply_whitelist "$config_file" 0
+  fi
+
+  info "校验中..."
+  xray run -test -config "$config_file"
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "$ss_port/tcp" || warn "放行 $ss_port/tcp 失败"
+    ufw allow "$ss_port/udp" || warn "放行 $ss_port/udp 失败"
+  fi
+
+  systemctl enable xray
+  systemctl restart xray
+  sleep 2
+  systemctl status xray --no-pager -l | head -n 20 || true
+
+  vless_port="$(jq -r '.inbounds[] | select(.protocol == "vless") | .port // empty' "$config_file" 2>/dev/null | head -n 1 || true)"
+  if [ -n "$vless_port" ]; then
+    TQ_PORT="$vless_port"
+  else
+    TQ_PORT="$ss_port"
+  fi
+  TQ_SS_PORT="$ss_port"
+  write_tq_conf
+  install_traffic_watch
+
+  ss_link="$(build_ss_link "2022-blake3-aes-256-gcm" "$ss_password" "$ss_addr" "$ss_port")"
+  write_ss_outputs "$ss_addr" "$ss_port" "$ss_password" "$ss_link"
+  "$TQ_WATCH" run 2>/dev/null || true
+
+  echo ""
+  cat "$SS_INFO_FILE"
+  echo "配置：$config_file"
+  echo "日志：journalctl -u xray -f"
+  echo "保存到：$SS_INFO_FILE"
+  if [ -f "$INFO_FILE" ]; then
+    echo "VLESS 节点仍在，可用 查看节点 查看。"
+  fi
+}
+
 do_add() {
+  ask_protocol
+  if [ "$PROTOCOL" = "ss2022" ]; then
+    do_add_ss2022
+    return 0
+  fi
   # 已有节点时先确认，别静默覆盖（非交互不问，保持原样）
   if [ -f /usr/local/etc/xray/config.json ] && [ "$INTERACTIVE" = 1 ]; then
     local _ow
@@ -1550,6 +1983,8 @@ OUT_TQ_MODE="$TQ_MODE"; OUT_TQ_PERIOD="$TQ_PERIOD"; OUT_TQ_START="$TQ_START"
 OUT_TQ_LIMIT="$TQ_LIMIT"; OUT_TQ_QUOTA="$TQ_QUOTA"; OUT_TQ_RATE="$TQ_RATE"
 OUT_TQ_PRESET="$TQ_PRESET"
 TQ_PORT="$PORT"
+TQ_SS_PORT=0
+rm -f "$SS_INFO_FILE"
 write_tq_conf
 install_traffic_watch
 write_outputs

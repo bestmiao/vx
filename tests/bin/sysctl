@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+echo "sysctl $*" >> "$TQ_TEST_ROOT/log"
+case "$*" in
+  *tcp_congestion_control*) echo "bbr"; exit 0 ;;
+  *) exit 0 ;;
+esac

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$TQ_TEST_ROOT/log"
+ACTIVE="$TQ_TEST_ROOT/xray.active"
+rc=0
+case "$*" in
+  "is-active --quiet xray")
+    [ "$(cat "$ACTIVE" 2>/dev/null)" = "1" ] || rc=1
+    ;;
+  "start xray") echo 1 > "$ACTIVE" ;;
+  "stop xray") echo 0 > "$ACTIVE" ;;
+  "restart xray") echo 1 > "$ACTIVE" ;;
+  *) ;;
+esac
+exit $rc
